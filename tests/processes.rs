@@ -1,11 +1,12 @@
 //! What other processes do to a database: an owner that stops answering and resumes,
-//! a commit it was silent about, and clients killed in the middle of their transactions.
+//! one stopped while a process opens the database, a commit it was silent about, and
+//! clients killed in the middle of their transactions.
 
 mod common;
 
 use std::path::Path;
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::{base, builder};
 use kvshare::{Durability, Error, TreeBuilder};
@@ -96,6 +97,55 @@ async fn a_stopped_owner_is_silent_and_works_on_once_resumed() {
     drop((silent, after));
 
     client.close().await.expect("the client closes");
+    owner.start_kill().expect("SIGKILL to the owner");
+    owner.wait().await.expect("the owner exits");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A process that opens the database while its owner is stopped (a debugger, a laptop
+/// asleep, SIGSTOP) waits for the owner's welcome as long as the election timeout lets
+/// it, not only the call timeout, and is the owner's client once it resumes. An owner
+/// stopped for longer than that leaves it with `NoOwner`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn opening_waits_for_a_stopped_owner_as_long_as_the_election_allows() {
+    let base = base("stoppedopen");
+    let (db, run) = (base.join("db"), base.join("run"));
+    let (mut owner, said) = worker(&["serve", path(&db), path(&run)]).await;
+    assert_eq!(said, "owner", "the worker owns the database");
+    let pid = owner.id().expect("a running owner");
+    let open = |election: Duration| {
+        TreeBuilder::new()
+            .with_path(db.clone())
+            .with_versioning(true, 0)
+            .with_run_dir(run.clone())
+            .with_call_timeout(Duration::from_millis(300))
+            .with_election_timeout(election)
+            .build()
+    };
+
+    signal("STOP", pid).await;
+    let started = Instant::now();
+    let resume = async {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        signal("CONT", pid).await;
+    };
+    let (client, ()) = tokio::join!(open(Duration::from_secs(5)), resume);
+    let client = client.expect("opening waits for the stopped owner");
+    assert!(
+        started.elapsed() >= Duration::from_secs(1),
+        "the welcome came only after SIGCONT"
+    );
+    assert_eq!(client.owner_pid().await.expect("the owner"), pid);
+    client.close().await.expect("the client closes");
+
+    signal("STOP", pid).await;
+    match open(Duration::from_millis(800)).await {
+        Err(Error::NoOwner { waited }) => assert!(waited >= Duration::from_millis(800)),
+        Err(other) => panic!("an owner stopped too long should be no owner, got {other}"),
+        Ok(_) => panic!("a stopped owner cannot welcome a client"),
+    }
+    signal("CONT", pid).await;
+
     owner.start_kill().expect("SIGKILL to the owner");
     owner.wait().await.expect("the owner exits");
     let _ = std::fs::remove_dir_all(&base);

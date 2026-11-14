@@ -148,7 +148,10 @@ kvshare's own:
 - `OwnerSilent`: the owner holds the database but did not answer within the call
   timeout (5 s unless `with_call_timeout` says otherwise). The request still reaches the
   owner whole and may still be carried out; the connection stays usable.
-- `NoOwner`: nobody became the owner, nor answered as one, in time.
+- `NoOwner`: nobody became the owner, nor answered as one, within the election
+  timeout. Opening waits that long for an owner on its way in or out: one that has not
+  bound its socket yet, has just died, is stopped and silent at its welcome, or hangs up
+  before it while it closes the database.
 - `TooManyTransactions`: a client holds 64 open transactions on its connection already;
   it learns this on the first request of the one too many.
 - `Handshake`, `VersionMismatch`, `OptionsMismatch`: the owner and the client disagree.
@@ -262,13 +265,15 @@ cargo test
   cursor over keys only; a cursor moved in a spawned task.
 - `tests/processes.rs`: an owner stopped with SIGSTOP, whose client gets `OwnerSilent`
   and works on over the same connection once SIGCONT resumes it, a request bigger than
-  the socket's buffer arriving whole; a commit the owner was silent about, which the
-  client's next transaction sees; clients killed with SIGKILL while their transactions
-  are open.
+  the socket's buffer arriving whole; opening the database while the owner is stopped,
+  which waits for it within the election timeout and is `NoOwner` past it; a commit the
+  owner was silent about, which the client's next transaction sees; clients killed with
+  SIGKILL while their transactions are open.
 - `tests/failover.rs`: writers in several processes while the owner is killed again
   and again; `KVSHARE_FAILOVER_SECONDS` makes it run longer than 6 seconds.
-- Unit tests: frames, endpoints, a write stall across the socket, and a client that
-  refuses an owner of another protocol version, another database or other options.
+- Unit tests: frames, endpoints, a write stall across the socket, a client that
+  refuses an owner of another protocol version, another database or other options, and
+  one that elects again when the owner hangs up before its welcome.
 - `tests/sim.rs`: the simulation below; its checks find every fault put into a run made
   by hand, and a run of 30 seconds finds nothing wrong.
 

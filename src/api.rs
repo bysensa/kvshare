@@ -231,7 +231,9 @@ impl TreeBuilder {
     }
 
     /// The pid of the process that owns this builder's database now, asked over its
-    /// socket, without taking part in the election.
+    /// socket, without taking part in the election. No owner to ask is an `Error::Io`:
+    /// `NotFound` or `ConnectionRefused` with no socket or none listening, `TimedOut`
+    /// for an owner silent past the call timeout, `UnexpectedEof` for one going away.
     ///
     /// SurrealKV's lock file is no witness: every process that tries to open the
     /// database truncates it before it tries the lock, which erases the owner's pid.
