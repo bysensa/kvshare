@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use kvshare::{Durability, Tree, TreeBuilder};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::UnixStream;
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 
 /// Keys written before the measurement, read back in turn.
 const KEYS: usize = 1_000;
@@ -29,31 +29,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = std::fs::remove_dir_all(&base);
     let run_dir = base.join("run");
 
-    let local = open(base.join("local"), &run_dir).await?;
-    let in_process = measure(&local, iterations).await?;
+    let walks = iterations / 100;
+    let local = open(base.join("local"), &run_dir, false).await?;
+    let mut in_process = measure(&local, iterations).await?;
+    local.close().await?;
+    let local = open(base.join("local-vlog"), &run_dir, true).await?;
+    in_process.extend(measure_value_log(&local, walks).await?);
     local.close().await?;
 
-    // Another process owns this database; this one reaches it through the socket.
+    // Another process owns these databases; this one reaches them through the socket.
     let remote_db = base.join("remote");
-    let mut owner = Command::new(sibling("kv-worker")?)
-        .arg("serve")
-        .arg(&remote_db)
-        .arg(&run_dir)
-        .stdout(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()?;
-    let mut said = String::new();
-    BufReader::new(owner.stdout.take().expect("a piped stdout"))
-        .read_line(&mut said)
-        .await?;
-    assert_eq!(said.trim(), "owner", "the child process owns the database");
-    let remote = open(remote_db, &run_dir).await?;
+    let mut owner = spawn_owner(&remote_db, &run_dir, false).await?;
+    let remote = open(remote_db, &run_dir, false).await?;
     assert_eq!(
         remote.owner_pid().await?,
         owner.id().expect("a running owner"),
         "this process works through the child"
     );
-    let through_socket = measure(&remote, iterations).await?;
+    let mut through_socket = measure(&remote, iterations).await?;
+    remote.close().await?;
+    owner.start_kill()?;
+    owner.wait().await?;
+    let remote_db = base.join("remote-vlog");
+    let mut owner = spawn_owner(&remote_db, &run_dir, true).await?;
+    let remote = open(remote_db, &run_dir, true).await?;
+    through_socket.extend(measure_value_log(&remote, walks).await?);
     remote.close().await?;
     owner.start_kill()?;
     owner.wait().await?;
@@ -86,7 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = std::fs::remove_dir_all(&base);
 
     println!(
-        "iterations: {iterations} (Immediate and scans: {}), load average: {}",
+        "iterations: {iterations} (Immediate and scans: {}, value log: {walks}), load average: {}",
         iterations / 20,
         load_average()
     );
@@ -118,14 +118,77 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Open the database at `db`, which elects at once.
-async fn open(db: PathBuf, run_dir: &Path) -> Result<Tree, kvshare::Error> {
+/// Open the database at `db`, which elects at once; with `vlog`, large values go to the
+/// value log.
+async fn open(db: PathBuf, run_dir: &Path, vlog: bool) -> Result<Tree, kvshare::Error> {
     TreeBuilder::new()
         .with_path(db)
         .with_versioning(true, 0)
+        .with_enable_vlog(vlog)
         .with_run_dir(run_dir.to_path_buf())
         .build()
         .await
+}
+
+/// A `kv-worker` that owns the database at `db`, once it says so.
+async fn spawn_owner(db: &Path, run_dir: &Path, vlog: bool) -> std::io::Result<Child> {
+    let mut command = Command::new(sibling("kv-worker")?);
+    command.arg("serve").arg(db).arg(run_dir);
+    if vlog {
+        command.arg("vlog");
+    }
+    let mut owner = command.stdout(Stdio::piped()).kill_on_drop(true).spawn()?;
+    let mut said = String::new();
+    BufReader::new(owner.stdout.take().expect("a piped stdout"))
+        .read_line(&mut said)
+        .await?;
+    assert_eq!(said.trim(), "owner", "the child process owns the database");
+    Ok(owner)
+}
+
+/// The keys of the value-log database and the size of each value: large enough that
+/// SurrealKV keeps the values in the value log.
+const LOGGED_KEYS: usize = 1_000;
+const LOGGED_VALUE: usize = 16 << 10;
+
+/// Time `walks` cursors over every key of `tree`, a database that keeps large values in
+/// the value log: reading the values, and reading keys only.
+async fn measure_value_log(
+    tree: &Tree,
+    walks: usize,
+) -> Result<Vec<(&'static str, Vec<Duration>)>, kvshare::Error> {
+    let mut tx = tree.begin().await?;
+    for n in 0..LOGGED_KEYS {
+        tx.set(format!("log-{n:06}").as_bytes(), vec![5u8; LOGGED_VALUE])?;
+    }
+    tx.commit().await?;
+
+    let mut rows = Vec::new();
+    for (name, keys_only) in [
+        ("cursor, 1000 values of 16 KiB in the log", false),
+        ("the same cursor, keys only", true),
+    ] {
+        let mut timed = Vec::with_capacity(walks);
+        for _ in 0..walks {
+            let started = Instant::now();
+            let tx = tree.begin().await?;
+            let mut read = 0;
+            {
+                let mut entries = tx.range(b"log-", b"log.")?;
+                entries.set_keys_only(keys_only);
+                let mut valid = entries.seek_first().await?;
+                while valid {
+                    read += 1;
+                    valid = entries.next().await?;
+                }
+            }
+            drop(tx);
+            timed.push(started.elapsed());
+            assert_eq!(read, LOGGED_KEYS, "the cursor reads every key");
+        }
+        rows.push((name, timed));
+    }
+    Ok(rows)
 }
 
 /// Time each operation on `tree`, after writing the keys it reads.

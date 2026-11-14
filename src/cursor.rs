@@ -21,7 +21,7 @@ use surrealkv::{InternalKeyKind, Value};
 
 use crate::api::Transaction;
 use crate::error::{Error, Result};
-use crate::protocol::{At, DEFAULT_PAGE, Item, Source};
+use crate::protocol::{At, DEFAULT_PAGE, Fetched, Item, Source};
 
 /// A key a cursor stands on, as SurrealKV's `InternalKeyRef`: the user's key, the
 /// sequence number and the kind of the write, and the time the version was written at.
@@ -95,6 +95,8 @@ pub struct Cursor<'t> {
     limit: Option<usize>,
     spent: usize,
     page: usize,
+    /// Whether pages carry values, or keys only.
+    values: bool,
     /// Whether a seek has positioned the cursor yet.
     started: bool,
     /// The page read last, in key order.
@@ -114,6 +116,7 @@ impl<'t> Cursor<'t> {
             limit,
             spent: 0,
             page: DEFAULT_PAGE,
+            values: true,
             started: false,
             items: Vec::new(),
             at: None,
@@ -126,6 +129,15 @@ impl<'t> Cursor<'t> {
     /// client's cursor asks the owner once a page.
     pub fn set_page_size(&mut self, entries: usize) {
         self.page = entries.max(1);
+    }
+
+    /// Read keys only, or values too (the default), from the next page the cursor reads
+    /// on: set it before the first move. A cursor over keys only never looks a value up
+    /// in the value log, and its `value`, `value_ref` and `value_into` answer
+    /// `Error::InvalidArgument`. This stands in for SurrealKV's `value_encoded`, which
+    /// lets a reader skip the value log too.
+    pub fn set_keys_only(&mut self, keys_only: bool) {
+        self.values = !keys_only;
     }
 
     /// Stand on the first entry at or past `target`, a user's key; for a history, on
@@ -192,13 +204,14 @@ impl<'t> Cursor<'t> {
 
     /// The value the cursor stands on.
     pub fn value(&self) -> Result<Value> {
-        Ok(self.item().value.clone()?)
+        Ok(self.value_ref()?.into_owned())
     }
 
     pub fn value_ref(&self) -> Result<Cow<'_, [u8]>> {
         match &self.item().value {
-            Ok(value) => Ok(Cow::Borrowed(value)),
-            Err(error) => Err(Error::from(error.clone())),
+            Fetched::Value(value) => Ok(Cow::Borrowed(value)),
+            Fetched::Failed(error) => Err(Error::from(error.clone())),
+            Fetched::Skipped => Err(Error::InvalidArgument("the cursor reads keys only".into())),
         }
     }
 
@@ -257,7 +270,10 @@ impl<'t> Cursor<'t> {
             At::Last => (true, false),
             _ => (true, true),
         };
-        let (mut items, more) = self.transaction.page(&self.source, at, wanted).await?;
+        let (mut items, more) = self
+            .transaction
+            .page(&self.source, at, wanted, self.values)
+            .await?;
         if items.is_empty() {
             self.items.clear();
             self.at = None;

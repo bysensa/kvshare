@@ -46,12 +46,13 @@ async fn example() -> kvshare::Result<()> {
 | S1 | `TreeBuilder`, `Tree`, `Transaction` with SurrealKV's names; point reads and writes, savepoints, commit and rollback | done |
 | S2 | Cursors with `seek`, `next`, `prev`; history | done |
 | S3 | `Tree`'s administrative operations through the owner | done |
-| S4 | Robustness, a cursor over keys only, Linux, documentation | next |
+| S4 | Robustness, a cursor over keys only, documentation | done |
 
 ## Boundaries
 
 - macOS and Linux. Not Windows, not a browser (`with_file_system`), not network file
   systems, not several machines.
+- Tested on macOS only: no test has run on Linux yet.
 - SurrealKV `=1.4.0`.
 
 ## Mapping to SurrealKV's API
@@ -78,7 +79,7 @@ the transaction sees.
 | `Transaction::iter`, `scan`, `range`, `range_with_options`, `history`, `history_with_options` | the same | they return a `Cursor` |
 | `LSMIterator`: `seek`, `seek_first`, `seek_last`, `next`, `prev` | `Cursor`: the same, `async` | `seek` takes a user's key, as SurrealKV's transaction iterators do |
 | `LSMIterator`: `valid`, `key`, `value`, `value_ref`, `value_into` | `Cursor`: the same | `key` returns kvshare's `InternalKeyRef`, with SurrealKV's methods |
-| `LSMIterator`: `value_encoded`, `reanchor_first`, `reanchor_last` | none | a client has the values resolved; the re-anchors serve SurrealKV's merging iterators |
+| `LSMIterator`: `value_encoded`, `reanchor_first`, `reanchor_last` | none | a client has the values resolved, and `Cursor::set_keys_only` skips the value log as `value_encoded` lets a reader do; the re-anchors serve SurrealKV's merging iterators |
 | `KeyRange`, `ReadOptions::from_range` | the same | kvshare's own: SurrealKV keeps `KeyRange` in a private module |
 | `HistoryOptions`, `InternalKeyKind` | the same | SurrealKV's |
 | `Tree::view` | the same, `async` | the closure is `async` too, as reads are |
@@ -94,7 +95,9 @@ kvshare adds:
 - `TreeBuilder::current_owner`: the owner's pid, asked over its socket, without taking
   part in the election;
 - `Tree::is_owner`, `Tree::owner_pid`, `Transaction::is_local`;
-- `Cursor::set_page_size`: how many entries a cursor reads at once, 256 unless set.
+- `Cursor::set_page_size`: how many entries a cursor reads at once, 256 unless set;
+- `Cursor::set_keys_only`: a cursor that reads keys only, so no value is looked up in
+  the value log; its `value` answers `Error::InvalidArgument`.
 
 ## Cursors
 
@@ -111,25 +114,52 @@ repeats what SurrealKV's iterators do: a cursor not yet positioned seeks on its 
 move, an exhausted one stays so until a seek, and a history's `limit` is spent by each
 entry a move lands on, kept across a change of direction and renewed by a seek.
 
-The processes of one database must agree on the options that change what is stored: the
-versions kept and their retention, the comparator, the value log and encryption. A
-client whose options differ from the owner's is refused with `Error::OptionsMismatch`.
-The other options tune the owner and may differ.
+## Options every process must set alike
+
+Any process may become the owner, so every process of one database must open it with
+the options that change what is stored or how it is read. kvshare compares what it can:
+the owner's welcome carries a fingerprint of whether versions are kept and for how
+long, the comparator's name, whether the value log is on, whether there is a key
+manager, and the cipher. A client whose fingerprint differs is refused with
+`Error::OptionsMismatch` when it opens the tree.
+
+Some options are objects kvshare cannot compare, and they must be the same in every
+process all the same:
+
+- the comparator: only its name is compared, so two comparators of one name must order
+  keys alike;
+- the filter policy: not compared at all;
+- the key manager: only whether there is one is compared; every process needs one that
+  holds the database's keys, as it may become the owner.
+
+The other options (sizes, caches, thresholds, compression) tune the process that owns
+the database and may differ.
 
 ## Errors
 
 `kvshare::Error` names SurrealKV's errors as SurrealKV does
-(`TransactionWriteConflict`, `TransactionReadOnly`, `EmptyKey`, …), so the owner and its
-clients see the same error for the same operation; SurrealKV's other errors are
-`Engine` with SurrealKV's text. The errors of reaching the owner are kvshare's own:
+(`TransactionWriteConflict`, `TransactionReadOnly`, `EmptyKey`, `WriteStall`, …), so the
+owner and its clients see the same error for the same operation; SurrealKV's other
+errors are `Engine` with SurrealKV's text. The errors of reaching the owner are
+kvshare's own:
 
-- `OwnerLost`: the owner went away during the operation. For a commit, whether it
-  happened is unknown. The next transaction elects a new owner.
-- `OwnerSilent`: the owner holds the database but did not answer in time.
+- `OwnerLost`: the owner went away during the operation. The next transaction elects a
+  new owner.
+- `OwnerSilent`: the owner holds the database but did not answer within the call
+  timeout (5 s unless `with_call_timeout` says otherwise). The request still reaches the
+  owner whole and may still be carried out; the connection stays usable.
 - `NoOwner`: nobody became the owner, nor answered as one, in time.
 - `TooManyTransactions`: a client holds 64 open transactions on its connection already;
   it learns this on the first request of the one too many.
 - `Handshake`, `VersionMismatch`, `OptionsMismatch`: the owner and the client disagree.
+
+**A commit that ends in `OwnerLost` or `OwnerSilent` may have happened or not.** The
+owner may have committed it just before it died or while it did not answer, and a
+commit that reached a live owner stands even if its client never hears of it. kvshare
+has no way yet to ask what became of a commit. A caller that must know writes so that
+the transaction can be repeated safely (the same keys and values again), or reads the
+keys back in a new transaction before it decides; `tests/failover.rs` repeats its
+writes that way.
 
 ## Where kvshare differs from SurrealKV
 
@@ -141,8 +171,7 @@ clients see the same error for the same operation; SurrealKV's other errors are
   answer in a `Result`: the owner may not answer.
 - A client waits for a checkpoint, a restore, a compaction or an encryption status as
   long as it takes, without the call timeout: they copy, rewrite or read files.
-- A cursor reads each value of its page, even if only keys are looked at (a cursor over
-  keys only is planned for S4).
+- A cursor reads each value of its page unless it reads keys only (`set_keys_only`).
 - Finding an entry again for the next page steps through the versions of its key, so a
   history of a key with very many versions read in small pages reads them repeatedly.
 
@@ -175,10 +204,14 @@ and what it commits lands on it.
 
 On macOS (arm64), in release builds.
 
-Killing the owner with SIGKILL about 15 times in 6 s under 4 writing processes lost no
-commit a writer had seen return, with `Durability::Eventual` and `Immediate`
-(`tests/failover.rs`; in the spike, the first commit after a kill came 40 to 70 ms
-later, median).
+`tests/failover.rs` kills the owner with SIGKILL every 300 ms under 4 writing
+processes and checks every commit a writer saw return. At S4, run for 120 s
+(`KVSHARE_FAILOVER_SECONDS=120`, both tests at once), no returned commit was lost:
+
+| Durability | Commits returned | Owners killed | Missing | First commit after a kill, median (max) |
+|---|---|---|---|---|
+| `Eventual` | 391 844 | 277 | 0 | 95 ms (403 ms) |
+| `Immediate` | 29 961 | 337 | 0 | 46 ms (255 ms) |
 
 `kv-latency 10000` at S2, with a load average of about 5 (medians, p99 in brackets):
 
@@ -195,6 +228,14 @@ later, median).
 A read through the owner costs one socket round trip: `begin` and `rollback` do not
 wait for the owner.
 
+A cursor over 1000 keys whose values, 16 KiB each, lie in the value log, at S4 with a
+load average of about 12, so slower than above throughout (medians, p99 in brackets):
+
+| Cursor | In the owner | Through the socket |
+|---|---|---|
+| reading the values | 0.90 ms (3.8) | 28.9 ms (41.4) |
+| keys only (`set_keys_only`) | 0.09 ms (0.10) | 0.21 ms (0.46) |
+
 ## Tests
 
 ```sh
@@ -202,16 +243,22 @@ cargo test
 ```
 
 - `tests/differential.rs`: the same scenarios on SurrealKV, an owner and a client,
-  among them every operation on the whole database and a restore with a transaction
-  open.
+  among them every operation on the whole database, a restore with a transaction open,
+  and cursors over keys only.
 - `tests/handover.rs`: the election, hand-over, conflicts, a client's own writes, many
-  tasks of one client, a client that leaves, an owner that crashes, the bound on open
-  transactions.
+  tasks of one client, a client that leaves, an owner that crashes, a client with other
+  options, the bound on open transactions.
 - `tests/scan.rs`: cursors over ranges and histories in pages, the same in the owner
   and through the socket; a reversed range; a history of a tree without versions; a
-  cursor moved in a spawned task.
+  cursor over keys only; a cursor moved in a spawned task.
+- `tests/processes.rs`: an owner stopped with SIGSTOP, whose client gets `OwnerSilent`
+  and works on over the same connection once SIGCONT resumes it, a request bigger than
+  the socket's buffer arriving whole; clients killed with SIGKILL while their
+  transactions are open.
 - `tests/failover.rs`: writers in several processes while the owner is killed again
-  and again.
+  and again; `KVSHARE_FAILOVER_SECONDS` makes it run longer than 6 seconds.
+- Unit tests: frames, endpoints, a write stall across the socket, and a client that
+  refuses an owner of another protocol version, another database or other options.
 
 `cargo run --release --bin kv-latency` prints the latencies.
 

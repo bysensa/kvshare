@@ -2,7 +2,9 @@
 //! killed with SIGKILL again and again: every commit a writer saw return is in the
 //! database afterwards, and a new owner takes over each time.
 //!
-//! Run with `--nocapture` to see the counts and how long each hand-over took.
+//! Run with `--nocapture` to see the counts and how long each hand-over took, and with
+//! `KVSHARE_FAILOVER_SECONDS` set to kill owners for longer than the 6 seconds of a
+//! usual run.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -13,8 +15,16 @@ use surrealkv::{Mode, TreeBuilder};
 use tokio::process::{Child, Command};
 
 const WRITERS: usize = 4;
-const KILLING_FOR: Duration = Duration::from_secs(6);
 const BETWEEN_KILLS: Duration = Duration::from_millis(300);
+
+/// How long owners are killed: 6 seconds, or `KVSHARE_FAILOVER_SECONDS`.
+fn killing_for() -> Duration {
+    let seconds = std::env::var("KVSHARE_FAILOVER_SECONDS")
+        .ok()
+        .and_then(|seconds| seconds.parse().ok())
+        .unwrap_or(6);
+    Duration::from_secs(seconds)
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn no_returned_commit_is_lost_when_owners_are_killed_eventual() {
@@ -48,8 +58,8 @@ async fn kill_owners_while_writing(durability: &str) {
         .with_versioning(true, 0)
         .with_run_dir(run_dir.clone());
     let mut kills: Vec<u128> = Vec::new();
-    let started = Instant::now();
-    while started.elapsed() < KILLING_FOR {
+    let (started, killing_for) = (Instant::now(), killing_for());
+    while started.elapsed() < killing_for {
         tokio::time::sleep(BETWEEN_KILLS).await;
         let Ok(pid) = probe.current_owner().await else {
             continue;

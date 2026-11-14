@@ -1140,16 +1140,20 @@ impl Transaction {
     }
 
     /// A page of a cursor over `source`: up to `limit` entries from `at`, in the order
-    /// they were read, and whether more follow that way. In a client the owner reads it,
-    /// and the first page carries the writes the transaction has kept.
+    /// they were read, with their values or not, and whether more follow that way. In a
+    /// client the owner reads it, and the first page carries the writes the transaction
+    /// has kept.
     pub(crate) async fn page(
         &self,
         source: &Source,
         at: At,
         limit: usize,
+        values: bool,
     ) -> Result<(Vec<Item>, bool)> {
         let remote = match &self.state {
-            State::Local(transaction) => return Ok(page(transaction, source, at, limit)?),
+            State::Local(transaction) => {
+                return Ok(page(transaction, source, at, limit, values)?);
+            }
             State::Remote(remote) => remote,
         };
         let answer = remote
@@ -1159,6 +1163,7 @@ impl Transaction {
                 source: source.clone(),
                 at,
                 limit: u32::try_from(limit).unwrap_or(u32::MAX),
+                values,
             })
             .await?;
         match answer {

@@ -11,6 +11,7 @@ use std::io;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use surrealkv::WriteStallReason;
 
 use crate::protocol::TxId;
 
@@ -31,6 +32,10 @@ pub enum Error {
     EmptyKey,
     KeyNotFound,
     InvalidArgument(String),
+    /// SurrealKV held the write back: too much waits to be flushed or compacted.
+    WriteStall {
+        reason: WriteStallReason,
+    },
     /// Any other SurrealKV error, as SurrealKV words it.
     Engine(String),
     /// The owner already holds as many open transactions of this process as it allows.
@@ -73,6 +78,7 @@ impl fmt::Display for Error {
             Error::EmptyKey => write!(f, "empty key"),
             Error::KeyNotFound => write!(f, "key not found"),
             Error::InvalidArgument(reason) => write!(f, "invalid argument: {reason}"),
+            Error::WriteStall { reason } => write!(f, "write stall: {reason:?}"),
             Error::Engine(reason) => write!(f, "SurrealKV: {reason}"),
             Error::TooManyTransactions => write!(f, "too many open transactions"),
             Error::OwnerLost(reason) => write!(f, "the owner went away: {reason}"),
@@ -110,6 +116,8 @@ pub(crate) enum KvError {
     EmptyKey,
     KeyNotFound,
     InvalidArgument(String),
+    /// A write stall, its reason as a number.
+    WriteStall(u8),
     Engine(String),
     TooManyTransactions,
     /// The connection holds no transaction with this number: a client out of step with
@@ -129,6 +137,12 @@ impl From<surrealkv::Error> for KvError {
             surrealkv::Error::EmptyKey => KvError::EmptyKey,
             surrealkv::Error::KeyNotFound => KvError::KeyNotFound,
             surrealkv::Error::InvalidArgument(reason) => KvError::InvalidArgument(reason),
+            surrealkv::Error::WriteStall {
+                reason: WriteStallReason::MemtableLimit,
+            } => KvError::WriteStall(0),
+            surrealkv::Error::WriteStall {
+                reason: WriteStallReason::L0FileLimit,
+            } => KvError::WriteStall(1),
             other => KvError::Engine(other.to_string()),
         }
     }
@@ -146,6 +160,15 @@ impl From<KvError> for Error {
             KvError::EmptyKey => Error::EmptyKey,
             KvError::KeyNotFound => Error::KeyNotFound,
             KvError::InvalidArgument(reason) => Error::InvalidArgument(reason),
+            KvError::WriteStall(0) => Error::WriteStall {
+                reason: WriteStallReason::MemtableLimit,
+            },
+            KvError::WriteStall(1) => Error::WriteStall {
+                reason: WriteStallReason::L0FileLimit,
+            },
+            KvError::WriteStall(other) => {
+                Error::Handshake(format!("the owner sent {other} for a write stall's reason"))
+            }
             KvError::Engine(reason) => Error::Engine(reason),
             KvError::TooManyTransactions => Error::TooManyTransactions,
             KvError::NoSuchTransaction(tx) => {
@@ -163,3 +186,25 @@ impl From<surrealkv::Error> for Error {
 
 /// The result of an operation of kvshare.
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A write stall crosses the socket as the variant and the reason SurrealKV gave.
+    #[test]
+    fn a_write_stall_keeps_its_reason_across_the_socket() {
+        for reason in [
+            WriteStallReason::MemtableLimit,
+            WriteStallReason::L0FileLimit,
+        ] {
+            let sent = KvError::from(surrealkv::Error::WriteStall { reason });
+            let wire = postcard::to_allocvec(&sent).expect("encoded");
+            let received: KvError = postcard::from_bytes(&wire).expect("decoded");
+            match Error::from(received) {
+                Error::WriteStall { reason: got } => assert_eq!(got, reason),
+                other => panic!("a write stall became {other:?}"),
+            }
+        }
+    }
+}

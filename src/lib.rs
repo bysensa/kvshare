@@ -46,7 +46,7 @@ pub use surrealkv::{
     BackgroundErrorReason, CipherPreference, CompactRangeOptions, Comparator, CompressionType,
     Durability, ErrorSeverity, FilterPolicy, HistoryOptions, InternalKeyKind, IntoBytes, Key,
     KeyManager, Mode, Options, VLogChecksumLevel, Value, WalRecoveryMode, WalRecoveryReport,
-    WriteOptions,
+    WriteOptions, WriteStallReason,
 };
 #[doc(hidden)]
 pub use surrealkv::{CipherSuite, KeyState, tde::DbId};

@@ -344,6 +344,34 @@ async fn a_history_without_versions_is_refused_as_surrealkv_refuses_it() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// A cursor over keys only finds the keys a cursor over values finds, and refuses to
+/// give a value, in the owner and through the socket.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cursor_over_keys_only_refuses_values() {
+    let base = base("keys-only");
+    let (owner, client) = owner_and_client(&base).await;
+    write_ten_keys(&owner).await;
+
+    for (who, tree) in [("owner", &owner), ("client", &client)] {
+        let tx = tree.begin().await.expect("a transaction");
+        let mut cursor = tx.range(b"k", b"l").expect("a cursor");
+        cursor.set_keys_only(true);
+        cursor.set_page_size(3);
+        let mut seen = Vec::new();
+        let mut valid = cursor.seek_first().await.expect("a seek");
+        while valid {
+            seen.push(String::from_utf8_lossy(cursor.key().user_key()).into_owned());
+            match cursor.value() {
+                Err(kvshare::Error::InvalidArgument(_)) => {}
+                other => panic!("{who}: a cursor over keys only gave {other:?}"),
+            }
+            valid = cursor.next().await.expect("a move");
+        }
+        assert_eq!(seen, ten_keys(), "{who}");
+    }
+    close(owner, client, &base).await;
+}
+
 /// A cursor's moves can be awaited in a spawned task: what it holds crosses threads.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cursor_moves_in_a_spawned_task() {

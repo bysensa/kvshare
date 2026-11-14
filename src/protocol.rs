@@ -39,7 +39,7 @@ use crate::error::KvError;
 use crate::types::{WireDurability, WireMode};
 
 /// The version of the protocol. Bump it when a message would mean something else.
-pub const VERSION: u32 = 6;
+pub const VERSION: u32 = 7;
 
 /// How many transactions one connection may hold open at once.
 pub const MAX_TRANSACTIONS: usize = 64;
@@ -215,8 +215,18 @@ pub(crate) struct Item {
     /// When the version was written: SurrealKV reports it for a history and 0 for a range.
     pub(crate) timestamp: u64,
     pub(crate) nth: Nth,
-    /// What SurrealKV's `value()` answered for it.
-    pub(crate) value: Result<Vec<u8>, KvError>,
+    pub(crate) value: Fetched,
+}
+
+/// The value of an entry of a page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum Fetched {
+    /// What SurrealKV's `value()` answered.
+    Value(Vec<u8>),
+    /// The error SurrealKV's `value()` answered.
+    Failed(KvError),
+    /// Not read: the cursor reads keys only.
+    Skipped,
 }
 
 impl Item {
@@ -268,13 +278,15 @@ pub(crate) enum Request {
         keys: Vec<Vec<u8>>,
         timestamp: u64,
     },
-    /// A page of up to `limit` entries of `source`, from `at`.
+    /// A page of up to `limit` entries of `source`, from `at`; with their values, or
+    /// with keys only.
     Cursor {
         tx: TxId,
         writes: Vec<Write>,
         source: Source,
         at: At,
         limit: u32,
+        values: bool,
     },
     /// Commit transaction `tx`, whose commit returns as `durability` says. The
     /// transaction ends whatever the answer.
@@ -311,13 +323,18 @@ where
     W: AsyncWrite + Unpin,
     T: Serialize,
 {
+    writer.write_all(&encode_frame(message)?).await
+}
+
+/// `message` as one frame: its length, then the message.
+pub(crate) fn encode_frame<T: Serialize>(message: &T) -> io::Result<Vec<u8>> {
     let mut frame = postcard::to_extend(message, vec![0u8; 4]).map_err(io::Error::other)?;
     let length = u32::try_from(frame.len() - 4)
         .ok()
         .filter(|length| *length <= MAX_FRAME)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "the message is too long"))?;
     frame[..4].copy_from_slice(&length.to_le_bytes());
-    writer.write_all(&frame).await
+    Ok(frame)
 }
 
 /// Read one frame and decode its message.

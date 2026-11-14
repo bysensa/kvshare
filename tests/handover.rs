@@ -213,6 +213,22 @@ async fn a_client_takes_over_from_an_owner_that_crashes() {
     close(owner, client, &base).await;
 }
 
+/// A process whose options change what is stored (here, whether versions are kept)
+/// cannot work through an owner that set them otherwise.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_with_other_options_is_refused() {
+    let base = base("options");
+    let owner = builder(&base).build().await.expect("the owner");
+    let other = builder(&base).with_versioning(false, 0).build().await;
+    match other {
+        Err(Error::OptionsMismatch) => {}
+        Err(error) => panic!("other options should be refused, got {error}"),
+        Ok(_) => panic!("other options should be refused"),
+    }
+    owner.close().await.expect("the owner closes");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 /// A client opens only as many transactions at once as the owner allows; one more is
 /// refused on its first request, and the others still work.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

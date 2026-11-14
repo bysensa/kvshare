@@ -160,3 +160,66 @@ fn jitter(low: Duration, high: Duration) -> Duration {
     let draw = RandomState::new().hash_one(Instant::now());
     low + Duration::from_nanos(draw % spread.max(1))
 }
+
+#[cfg(test)]
+mod tests {
+    use tokio::net::UnixListener;
+
+    use super::*;
+    use crate::protocol::{Welcome, write_frame};
+
+    /// A client refuses an owner that speaks another version of the protocol, or holds
+    /// another database, or set the options that must agree otherwise, before its
+    /// first request.
+    #[tokio::test]
+    async fn a_client_refuses_an_owner_it_cannot_understand() {
+        let base = std::env::temp_dir().join(format!("kvo-welcome-{}", std::process::id()));
+        let endpoint = Endpoint::new(&base.join("db"), &base.join("run")).expect("an endpoint");
+        std::fs::create_dir_all(base.join("run")).expect("the run directory");
+        let fingerprint = [7u8; 32];
+        let welcomes = [
+            Welcome {
+                version: VERSION + 1,
+                db: endpoint.db.clone(),
+                owner_pid: 1,
+                fingerprint,
+            },
+            Welcome {
+                version: VERSION,
+                db: base.join("another"),
+                owner_pid: 1,
+                fingerprint,
+            },
+            Welcome {
+                version: VERSION,
+                db: endpoint.db.clone(),
+                owner_pid: 1,
+                fingerprint: [8u8; 32],
+            },
+        ];
+        for welcome in welcomes {
+            let _ = std::fs::remove_file(&endpoint.socket);
+            let listener = UnixListener::bind(&endpoint.socket).expect("a fake owner");
+            let fake = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("the client");
+                write_frame(&mut stream, &welcome).await.expect("a welcome");
+                // Keep the connection open until the client has read the welcome.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            });
+            let refusal = connect(&endpoint, fingerprint, Duration::from_secs(1))
+                .await
+                .err()
+                .expect("refused");
+            match refusal {
+                Error::VersionMismatch { owner, this } => {
+                    assert_eq!((owner, this), (VERSION + 1, VERSION));
+                }
+                Error::Handshake(reason) => assert!(reason.contains("another"), "{reason}"),
+                Error::OptionsMismatch => {}
+                other => panic!("an unexpected refusal: {other}"),
+            }
+            fake.await.expect("the fake owner ends");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}

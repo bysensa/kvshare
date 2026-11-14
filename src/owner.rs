@@ -190,8 +190,10 @@ async fn serve(stream: UnixStream, tree: Arc<Tree>, welcome: Arc<Welcome>) {
                 source,
                 at,
                 limit,
+                values,
             } => table.on(tx, writes, |transaction| {
-                let (items, more) = page(transaction, &source.narrowed(), at, limit as usize)?;
+                let source = source.narrowed();
+                let (items, more) = page(transaction, &source, at, limit as usize, values)?;
                 Ok(Answer::Page { items, more })
             }),
             Request::Commit {

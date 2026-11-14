@@ -14,8 +14,7 @@
 
 use surrealkv::{HistoryOptions, LSMIterator, Transaction, WriteOptions};
 
-use crate::error::KvError;
-use crate::protocol::{At, Item, Nth, PAGE_BYTES, Position, Source, Write};
+use crate::protocol::{At, Fetched, Item, Nth, PAGE_BYTES, Position, Source, Write};
 use crate::types::just_past;
 
 /// Apply `writes` to `transaction` in their order, each by the SurrealKV method the
@@ -90,12 +89,14 @@ pub(crate) fn open<'t>(
 }
 
 /// Up to `limit` entries of `source` on `transaction` from `at`, in the order they were
-/// read; and whether more follow that way.
+/// read; and whether more follow that way. Without `values`, no value is read, so a
+/// value in the value log is not looked up.
 pub(crate) fn page(
     transaction: &Transaction,
     source: &Source,
     at: At,
     limit: usize,
+    values: bool,
 ) -> surrealkv::Result<(Vec<Item>, bool)> {
     let mut cursor = open(transaction, source)?;
     let forwards = at.forwards();
@@ -121,7 +122,14 @@ pub(crate) fn page(
             let key = cursor.key();
             (key.encoded().to_vec(), key.timestamp())
         };
-        let value = cursor.value().map_err(KvError::from);
+        let value = if !values {
+            Fetched::Skipped
+        } else {
+            match cursor.value() {
+                Ok(value) => Fetched::Value(value),
+                Err(error) => Fetched::Failed(error.into()),
+            }
+        };
         let mut item = Item {
             key,
             timestamp,
@@ -129,7 +137,10 @@ pub(crate) fn page(
             value,
         };
         item.nth = step(previous.as_ref(), item.user_key(), forwards);
-        bytes += item.key.len() + item.value.as_ref().map_or(0, Vec::len);
+        bytes += item.key.len();
+        if let Fetched::Value(value) = &item.value {
+            bytes += value.len();
+        }
         previous = Some(item.position());
         items.push(item);
         valid = if forwards {

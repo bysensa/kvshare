@@ -4,8 +4,12 @@
 //!   `w<id>-00000000`, `w<id>-00000001`, … until killed, one per transaction. A commit
 //!   whose outcome is unknown is retried with the same key and value, which is safe to
 //!   write twice. Each commit that returned is appended to `acks` as `key\tunix_nanos`.
-//! - `kv-worker serve <db> <run_dir>`: take part in the election, print `owner` or
-//!   `client <pid>`, and wait until killed.
+//! - `kv-worker serve <db> <run_dir> [vlog]`: take part in the election, print `owner`
+//!   or `client <pid>`, and wait until killed; with `vlog`, large values go to the value
+//!   log.
+//! - `kv-worker hold <db> <run_dir> <id>`: begin a transaction, write `held-<id>`, read
+//!   `k` for update so that the owner has the write, print `holding`, and wait until
+//!   killed with the transaction open.
 //! - `kv-worker echo <socket>`: print `listening`, then send back every 64-byte frame
 //!   of the one connection it takes.
 
@@ -34,7 +38,9 @@ async fn main() -> ExitCode {
             };
             write(db.into(), run_dir.into(), id, durability, acks.into()).await
         }
-        ["serve", db, run_dir] => serve(db.into(), run_dir.into()).await,
+        ["serve", db, run_dir] => serve(db.into(), run_dir.into(), false).await,
+        ["serve", db, run_dir, "vlog"] => serve(db.into(), run_dir.into(), true).await,
+        ["hold", db, run_dir, id] => hold(db.into(), run_dir.into(), id).await,
         ["echo", socket] => echo(socket.into()).await,
         _ => return usage("unknown arguments"),
     };
@@ -54,7 +60,7 @@ async fn write(
     durability: Durability,
     acks: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let tree = open(db, run_dir).await?;
+    let tree = open(db, run_dir, false).await?;
     // One write per line and no buffer: a line that is written survives the death of
     // this process, as a commit in the page cache does.
     let mut acks = std::fs::OpenOptions::new()
@@ -88,8 +94,12 @@ async fn write(
     Ok(())
 }
 
-async fn serve(db: PathBuf, run_dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-    let tree = open(db, run_dir).await?;
+async fn serve(
+    db: PathBuf,
+    run_dir: PathBuf,
+    vlog: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let tree = open(db, run_dir, vlog).await?;
     let owner = tree.owner_pid().await?;
     if owner == std::process::id() {
         println!("owner");
@@ -101,12 +111,25 @@ async fn serve(db: PathBuf, run_dir: PathBuf) -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
-/// Open the database at `db` with versions kept, as every process of the tests does.
-/// Opening elects at once, so a database that is free on the way in is this process's.
-async fn open(db: PathBuf, run_dir: PathBuf) -> Result<Tree, Error> {
+async fn hold(db: PathBuf, run_dir: PathBuf, id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let tree = open(db, run_dir, false).await?;
+    let mut tx = tree.begin().await?;
+    tx.set(format!("held-{id}").as_bytes(), b"never committed")?;
+    tx.get_for_update(b"k").await?;
+    println!("holding");
+    std::io::stdout().flush()?;
+    std::future::pending::<()>().await;
+    Ok(())
+}
+
+/// Open the database at `db` with versions kept, as every process of the tests does,
+/// and with `vlog` large values in the value log. Opening elects at once, so a database
+/// that is free on the way in is this process's.
+async fn open(db: PathBuf, run_dir: PathBuf, vlog: bool) -> Result<Tree, Error> {
     TreeBuilder::new()
         .with_path(db)
         .with_versioning(true, 0)
+        .with_enable_vlog(vlog)
         .with_run_dir(run_dir)
         .build()
         .await
@@ -135,6 +158,7 @@ fn usage(problem: &str) -> ExitCode {
         "kv-worker: {problem}\n\
          usage: kv-worker write <db> <run_dir> <id> <eventual|immediate> <acks>\n\
          \x20      kv-worker serve <db> <run_dir>\n\
+         \x20      kv-worker hold <db> <run_dir> <id>\n\
          \x20      kv-worker echo <socket>"
     );
     ExitCode::from(2)

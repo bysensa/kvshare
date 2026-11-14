@@ -518,6 +518,19 @@ impl Tx {
 
     /// Open the cursor `open` and make `moves`, writing down what each answered.
     async fn walk(&mut self, open: &Open<'_>, moves: &[Move<'_>]) -> Vec<String> {
+        self.walk_reading(open, moves, true).await
+    }
+
+    /// Open the cursor `open` and make `moves`, writing down what each answered: with
+    /// the values, or, without `values`, keys only. A kvshare cursor then reads keys
+    /// only, and SurrealKV's iterator is not asked for values.
+    async fn walk_reading(
+        &mut self,
+        open: &Open<'_>,
+        moves: &[Move<'_>],
+        values: bool,
+    ) -> Vec<String> {
+        let unread = || Ok(b"(not read)".to_vec());
         match self {
             Tx::Plain(t) => {
                 let mut cursor = match open_plain(t, open) {
@@ -539,7 +552,11 @@ impl Tx {
                             lossy(key.user_key()),
                             key.timestamp(),
                             format!("{:?}", key.kind()),
-                            plain(cursor.value()),
+                            if values {
+                                plain(cursor.value())
+                            } else {
+                                unread()
+                            },
                         )
                     });
                     log.push(format!("{step:?}: {line}"));
@@ -552,6 +569,7 @@ impl Tx {
                     Err(error) => return vec![format!("open: err {error:?}")],
                 };
                 cursor.set_page_size(*page);
+                cursor.set_keys_only(!values);
                 let mut log = Vec::new();
                 for step in moves {
                     let answer = match *step {
@@ -563,11 +581,16 @@ impl Tx {
                     };
                     let line = landed(answer, cursor.valid(), || {
                         let key = cursor.key();
+                        let value = match cursor.value() {
+                            // A cursor over keys only refuses every value, as it should.
+                            Err(Error::InvalidArgument(_)) if !values => unread(),
+                            other => other,
+                        };
                         (
                             lossy(key.user_key()),
                             key.timestamp(),
                             format!("{:?}", key.kind()),
-                            cursor.value(),
+                            value,
                         )
                     });
                     log.push(format!("{step:?}: {line}"));
@@ -1214,6 +1237,42 @@ async fn history(db: &Db<'_>) -> Vec<String> {
     log
 }
 
+/// Cursors over keys only: the same keys, times and kinds of write as SurrealKV's
+/// iterators find, over a range and over a history, with the transaction's own writes.
+async fn keys(db: &Db<'_>) -> Vec<String> {
+    use Move::{First, Last, Next, Prev, Seek};
+    let mut log = Vec::new();
+    let mut seed = db.begin(Mode::ReadWrite).await;
+    for (key, at) in [("a", 100), ("a", 200), ("b", 150), ("c", 120), ("d", 130)] {
+        log.push(seed.set_at(key.as_bytes(), key.as_bytes(), at));
+    }
+    log.push(seed.commit().await);
+    let mut tx = db.begin(Mode::ReadWrite).await;
+    log.push(tx.set(b"bb", b"pending"));
+    log.push(tx.soft_delete(b"c"));
+    log.push(tx.delete(b"d"));
+    let tombstones = HistoryOptions::new().with_tombstones(true);
+    let walks: Vec<Walk<'_>> = vec![
+        ("range", Open::Range(b"a", b"z"), there_and_back(6)),
+        (
+            "history",
+            Open::History(b"a", b"z", tombstones.clone()),
+            there_and_back(8),
+        ),
+        (
+            "limit 2",
+            Open::History(b"a", b"z", tombstones.with_limit(2)),
+            vec![First, Next, Next, Prev, Seek(b"b"), Next, Last, Prev],
+        ),
+    ];
+    for (name, open, moves) in walks {
+        for line in tx.walk_reading(&open, &moves, false).await {
+            log.push(format!("{name} {line}"));
+        }
+    }
+    log
+}
+
 /// Operations on the whole database, and a restore while a transaction is open: what the
 /// transaction reads and commits after it, and what a new one reads.
 async fn admin(db: &Db<'_>) -> Vec<String> {
@@ -1293,6 +1352,11 @@ async fn admin(db: &Db<'_>) -> Vec<String> {
             .await
     )));
     log
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cursors_over_keys_only_are_the_same() {
+    compare("keys", &[1, 2, 256], keys).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
