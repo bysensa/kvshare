@@ -141,7 +141,7 @@ async fn turn(ctx: &mut Ctx, pid: u32, held: &Held) -> bool {
         let bodies = (0..batch)
             .map(|_| {
                 // Chunks of text, now and then a tool call of a few KiB, and once in a
-                // thousand entries an output large enough for the value log.
+                // thousand entries a large output, of 64 to 128 KiB.
                 let size = if ctx.rng.below(1_000) == 0 {
                     ctx.rng.between(64 << 10, 128 << 10)
                 } else if ctx.rng.chance(5) {

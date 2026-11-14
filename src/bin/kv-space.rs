@@ -44,23 +44,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for vlog in [true, false] {
         for (name, history) in histories {
             for pinned in [false, true] {
-                measure(&base, vlog, name, history, pinned).await?;
+                measure(&base, vlog, name, history, pinned, false).await?;
             }
         }
     }
+    // The key never replaced written again, its value unchanged, before the compaction:
+    // what a collector of the value log would do with the live values of its oldest file.
+    measure(&base, true, "none", None, true, true).await?;
     let _ = std::fs::remove_dir_all(&base);
     Ok(())
 }
 
-/// Write, close, compact and reopen one tree, and print what it takes.
+/// Write, close, compact and reopen one tree, and print what it takes. With `rewrite`,
+/// the key never replaced is written again, unchanged, before the compaction.
 async fn measure(
     base: &Path,
     vlog: bool,
     name: &str,
     history: Option<Duration>,
     pinned: bool,
+    rewrite: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let dir = base.join(format!("{vlog}-{name}-{pinned}").replace(' ', "-"));
+    let dir = base.join(format!("{vlog}-{name}-{pinned}-{rewrite}").replace(' ', "-"));
     let tree = open(&dir, vlog, history)?;
     let started = Instant::now();
     if pinned {
@@ -92,6 +97,13 @@ async fn measure(
         tokio::time::sleep(PAST_RETENTION).await;
     }
     let tree = Arc::new(open(&dir, vlog, history)?);
+    if rewrite {
+        let mut tx = tree.begin()?;
+        if let Some(value) = tx.get_for_update(b"pin")? {
+            tx.set(b"pin".to_vec(), value)?;
+        }
+        tx.commit().await?;
+    }
     let compacting = Arc::clone(&tree);
     let started = Instant::now();
     tokio::task::spawn_blocking(move || {
@@ -109,7 +121,11 @@ async fn measure(
     println!(
         "{:<9}  {name:<9} {:<20}  {:>13}  {:>10}  {files:>15}  {:>8}  {:>8}  {:>10}",
         if vlog { "on" } else { "off" },
-        if pinned { "yes" } else { "no" },
+        match (pinned, rewrite) {
+            (false, _) => "no",
+            (true, false) => "yes",
+            (true, true) => "yes, written again",
+        },
         in_vlog >> 20,
         tables >> 20,
         ms(write),

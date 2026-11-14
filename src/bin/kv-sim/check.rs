@@ -27,7 +27,6 @@ use crate::keys::{
     self, Answer, Entry, Fact, FileFacts, Lease, Meta, Metric, OpId, Status, Task, Total,
     Transition,
 };
-use crate::roles::VLOG_THRESHOLD;
 use crate::roles::keeper::last_checkpoint;
 
 /// Something wrong the check found.
@@ -125,8 +124,6 @@ impl Model {
     pub async fn read(path: &Path) -> Result<Model, String> {
         let tree = TreeBuilder::new()
             .with_path(path.to_path_buf())
-            .with_enable_vlog(true)
-            .with_vlog_value_threshold(VLOG_THRESHOLD)
             .build()
             .map_err(|e| e.to_string())?;
         let model = Model::from_tree(&tree).map_err(|e| e.to_string());

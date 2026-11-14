@@ -10,9 +10,8 @@
 //!   SurrealKV alone does, which kvshare's owner keeps from happening by waiting for its
 //!   compactions before it closes.
 //!
-//! `kv-owner [MiB…]` writes a base of 256 MiB as `kv-sim` writes (no history, a value
-//! log for values of 64 KiB and more, a fifth of the values of 2 to 8 KiB) and closes
-//! it. Then, for each amount of
+//! `kv-owner [MiB…]` writes a base of 256 MiB as `kv-sim` writes (no history, no value
+//! log, a fifth of the values of 2 to 8 KiB) and closes it. Then, for each amount of
 //! writes left in the memtable (0, 8, 32 and 96 MiB unless given), three times: it writes
 //! the amount and closes, opens, writes it again and abandons the tree as a crash would,
 //! and opens. Last, with the largest amount in the memtable, it times the commits before,
@@ -321,15 +320,10 @@ fn count(tree: &Tree) -> surrealkv::Result<(u64, u64)> {
     Ok((keys, unreadable))
 }
 
-/// Open the tree in `dir` as `kv-sim` opens it, with no history and the value log for
-/// values of 64 KiB and more only (none here), but with SurrealKV's memtable of 100 MB,
-/// which the measurement fills to each amount.
+/// Open the tree in `dir` as `kv-sim` opens it, with no history and no value log, but
+/// with SurrealKV's memtable of 100 MB, which the measurement fills to each amount.
 fn open(dir: &Path) -> surrealkv::Result<Tree> {
-    TreeBuilder::new()
-        .with_path(dir.to_path_buf())
-        .with_enable_vlog(true)
-        .with_vlog_value_threshold(64 << 10)
-        .build()
+    TreeBuilder::new().with_path(dir.to_path_buf()).build()
 }
 
 /// Keys in the order they are written, and values of random bytes.

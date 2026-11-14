@@ -260,9 +260,8 @@ load average of about 12, so slower than above throughout (medians, p99 in brack
 Every change of owner opens SurrealKV in the next owner, and an owner that leaves by
 `close` flushes its memtable first; one that crashed leaves the log of its memtable to
 replay. Both cost about 2.5 to 3.5 ms for each MiB the memtable holds. `kv-owner` on a
-base of 256 MiB written as `kv-sim` writes (no history, the value log for values of 64
-KiB and more, so none here), with a load average of about 5 (the range of three
-rounds):
+base of 256 MiB written as `kv-sim` writes (no history, no value log), with a load
+average of about 5 (the range of three rounds):
 
 | In the memtable | `close` | open after a `close` | open after a crash |
 |---|---|---|---|
@@ -277,8 +276,8 @@ off with a memtable of 16 to 32 MiB (`with_max_memtable_size`): the flush and th
 then stay under about 0.1 s, for more frequent flushes.
 
 A `close` also waits for the compactions the writes before it started in the
-background, which move the values with the keys when they are not in the value log:
-that is the `close` of the first row, 462 ms right after the base was written and 34 ms
+background, which move the values with the keys when there is no value log: that is
+the `close` of the first row, 462 ms right after the base was written and 34 ms
 two rounds later. It waits for a checkpoint that runs and, in kvshare, for a compaction
 a client asked for (see the SurrealKV gaps above), so an owner that leaves during either
 leaves once it is done. Checkpoints and compactions do not hold up commits meanwhile:
@@ -306,10 +305,18 @@ log, a compaction gives the space back but rewrites the large values it moves: i
 costs more as more large values live (3.6 times as much with 98 MiB of them). With it,
 the space of data that does not die in the order it was written is never given back.
 
+SurrealKV describes a collection of the value log by the share of dead entries in a
+file (`docs/ARCHITECTURE.md` of its crate), which 1.4.0 does not have; its README keeps
+the value log for large values, so that the memtable does not hold them in memory.
+The value log can be collected from outside, by writing the live values of its oldest
+files again and compacting the tables: `kv-space` shows it with the key never replaced
+(98 MiB down to 6 MiB).
+
 Data that is replaced or removed in no particular order, a code index or threads
-removed one by one, is better kept with no history and with the value log off, or on
-with a high `with_vlog_value_threshold` (64 KiB and more) for the rare very large
-values only, which `kv-sim` does.
+removed one by one, is better kept with no history and with the value log off, which
+`kv-sim` does. Values of hundreds of KiB and more, files above all, are better kept out
+of the database: a value crosses an owner's socket in one frame of at most 64 MiB and
+is held whole in memory on both sides.
 
 ## Tests
 
@@ -359,7 +366,7 @@ once, and checks the database against what each process says it did:
   small batches and record metrics into a total all threads share;
 - **readers**, which follow journals with cursors and check what every snapshot must hold;
 - **an indexer** of facts kept by the hash of their content, a fifth of them of 2 to 8
-  KiB and one in a hundred large enough for the value log, with counts of references;
+  KiB and one in a hundred of 64 to 192 KiB, with counts of references;
 - **a keeper**, which checkpoints, compacts and removes closed threads;
 - **a conductor**, which kills a process every two seconds or so, the owner most of all,
   and stops the owner for one to three seconds every eight.
@@ -373,7 +380,7 @@ are gone whole, every event has one answer, and the newest checkpoint holds toge
 The report gives the hooks' times by what the owner went through (calm, killed,
 stopped), every role's timings, the errors met, the processes' open files and memory,
 the space on disk, and the findings. The database is opened as Milou would open it: no
-history, the value log for values of 64 KiB and more, a memtable of 16 MiB. A run
+history, no value log, a memtable of 16 MiB. A run
 stops, and fails, when its disk has less than 2 GiB free.
 
 ```sh

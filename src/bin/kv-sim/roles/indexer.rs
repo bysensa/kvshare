@@ -3,7 +3,7 @@
 //! by the hash of their content and shared by the files that hold them, with a count of
 //! references; a fact no file refers to any more goes. One transaction changes the
 //! file's facts, the counts and the facts together. A fifth of the facts are large, of 2
-//! to 8 KiB, and one in a hundred very large, of 64 to 192 KiB, for the value log. After
+//! to 8 KiB, and one in a hundred very large, of 64 to 192 KiB. After
 //! each commit the indexer finds every fact of the file again with a cursor over keys
 //! only.
 
