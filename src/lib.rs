@@ -13,6 +13,7 @@
 //! cursor and `commit`.
 //!
 //! - `api`: the builder, the tree and the transaction a process uses.
+//! - `admin`: operations on the whole database: checkpoints, a restore, compaction.
 //! - `cursor`: cursors over a transaction's keys and versions.
 //! - `endpoint`: where the processes of one database meet.
 //! - `election`: who owns the database, and the role a process holds.
@@ -22,6 +23,7 @@
 //! - `exec`: what runs on a SurrealKV transaction for a request, the same for the
 //!   owner's clients and for the owner's own transactions.
 
+mod admin;
 mod api;
 mod client;
 mod cursor;
@@ -33,14 +35,21 @@ mod owner;
 mod protocol;
 mod types;
 
+pub use admin::{BackgroundError, CheckpointMetadata};
+// Hidden, as SurrealKV hides what `Tree::encryption_status` answers.
+#[doc(hidden)]
+pub use admin::{EncryptionStatus, FileTotals, KeyUsage};
 pub use api::{Transaction, Tree, TreeBuilder};
 pub use cursor::{Cursor, InternalKeyRef};
 pub use error::{Error, Result};
 pub use surrealkv::{
-    CipherPreference, Comparator, CompressionType, Durability, FilterPolicy, HistoryOptions,
-    InternalKeyKind, IntoBytes, Key, KeyManager, Mode, Options, VLogChecksumLevel, Value,
-    WalRecoveryMode, WriteOptions,
+    BackgroundErrorReason, CipherPreference, CompactRangeOptions, Comparator, CompressionType,
+    Durability, ErrorSeverity, FilterPolicy, HistoryOptions, InternalKeyKind, IntoBytes, Key,
+    KeyManager, Mode, Options, VLogChecksumLevel, Value, WalRecoveryMode, WalRecoveryReport,
+    WriteOptions,
 };
+#[doc(hidden)]
+pub use surrealkv::{CipherSuite, KeyState, tde::DbId};
 pub use types::{KeyRange, ReadOptions};
 
 // Compiles the README's Rust example as a doctest, so it cannot drift from the API.

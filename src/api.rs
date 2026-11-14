@@ -13,16 +13,20 @@
 //! Cursors are opened synchronously, as SurrealKV's iterators are, and move `async`.
 
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use surrealkv::{
-    CipherPreference, Comparator, CompressionType, Durability, FilterPolicy, HistoryOptions,
-    IntoBytes, KeyManager, Mode, Options, VLogChecksumLevel, Value, WalRecoveryMode, WriteOptions,
+    CipherPreference, CompactRangeOptions, Comparator, CompressionType, Durability, FilterPolicy,
+    HistoryOptions, IntoBytes, KeyManager, Mode, Options, VLogChecksumLevel, Value,
+    WalRecoveryMode, WalRecoveryReport, WriteOptions,
 };
 
+use crate::admin::{
+    Admin, BackgroundError, CheckpointMetadata, EncryptionStatus, Reply, run_blocking,
+};
 use crate::client::{Connection, Lost};
 use crate::cursor::Cursor;
 use crate::election::{Current, Role, connect};
@@ -290,25 +294,44 @@ impl Inner {
         })
     }
 
-    /// Wait for the answer to a request; a request the owner never answered forgets
-    /// the owner, and a refusal becomes the error it names.
+    /// Wait for the answer to a request, at most the call timeout.
     async fn call(
         &self,
         generation: u64,
         owner_pid: u32,
         call: impl Future<Output = std::result::Result<Answer, Lost>>,
     ) -> Result<Answer> {
-        match tokio::time::timeout(self.call_within, call).await {
-            Err(_) => Err(Error::OwnerSilent {
-                pid: owner_pid,
-                waited: self.call_within,
-            }),
-            Ok(Err(Lost(reason))) => {
+        self.wait(generation, owner_pid, call, Some(self.call_within))
+            .await
+    }
+
+    /// Wait for the answer to a request, at most `within` if it is set; a request the
+    /// owner never answered forgets the owner, and a refusal becomes the error it names.
+    async fn wait(
+        &self,
+        generation: u64,
+        owner_pid: u32,
+        call: impl Future<Output = std::result::Result<Answer, Lost>>,
+        within: Option<Duration>,
+    ) -> Result<Answer> {
+        let answered = match within {
+            Some(within) => {
+                tokio::time::timeout(within, call)
+                    .await
+                    .map_err(|_| Error::OwnerSilent {
+                        pid: owner_pid,
+                        waited: within,
+                    })?
+            }
+            None => call.await,
+        };
+        match answered {
+            Err(Lost(reason)) => {
                 self.forget(generation).await;
                 Err(Error::OwnerLost(reason))
             }
-            Ok(Ok(Answer::Failed(refusal))) => Err(refusal.into()),
-            Ok(Ok(answer)) => Ok(answer),
+            Ok(Answer::Failed(refusal)) => Err(refusal.into()),
+            Ok(answer) => Ok(answer),
         }
     }
 }
@@ -394,6 +417,158 @@ impl Tree {
             Route::Local { .. } => std::process::id(),
             Route::Remote { owner_pid, .. } => owner_pid,
         })
+    }
+
+    /// Read in a read-only transaction: `f` gets it, and it ends after.
+    pub async fn view<F>(&self, f: F) -> Result<()>
+    where
+        F: AsyncFnOnce(&mut Transaction) -> Result<()>,
+    {
+        let mut transaction = self.begin_with_mode(Mode::ReadOnly).await?;
+        f(&mut transaction).await
+    }
+
+    /// Make a checkpoint of the database in `checkpoint_dir`, which must lie outside the
+    /// database's directory. A relative path is this process's: it is made absolute
+    /// before the owner sees it. The owner's process writes the files.
+    pub async fn create_checkpoint<P: AsRef<Path>>(
+        &self,
+        checkpoint_dir: P,
+    ) -> Result<CheckpointMetadata> {
+        let dir = std::path::absolute(checkpoint_dir).map_err(Error::Io)?;
+        match self.admin(Admin::CreateCheckpoint(dir)).await? {
+            Reply::Checkpoint(metadata) => Ok(metadata),
+            other => Err(out_of_turn(Answer::Admin(other))),
+        }
+    }
+
+    /// Put the database back as the checkpoint in `checkpoint_dir` holds it, as
+    /// SurrealKV does: commits wait meanwhile. A transaction open across the restore
+    /// reads the restored database from then on, with its own writes, and what it
+    /// commits lands on it. A relative path is this process's.
+    pub async fn restore_from_checkpoint<P: AsRef<Path>>(
+        &self,
+        checkpoint_dir: P,
+    ) -> Result<CheckpointMetadata> {
+        let dir = std::path::absolute(checkpoint_dir).map_err(Error::Io)?;
+        match self.admin(Admin::RestoreFromCheckpoint(dir)).await? {
+            Reply::Checkpoint(metadata) => Ok(metadata),
+            other => Err(out_of_turn(Answer::Admin(other))),
+        }
+    }
+
+    /// Compact the keys of `[start, end)` down the tree, `None` for an open bound.
+    pub async fn compact_range(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        options: &CompactRangeOptions,
+    ) -> Result<()> {
+        let admin = Admin::CompactRange {
+            start: start.map(<[u8]>::to_vec),
+            end: end.map(<[u8]>::to_vec),
+            flush_memtable: options.flush_memtable,
+            target_level: options.target_level,
+            rewrite_bottommost: options.rewrite_bottommost,
+        };
+        done(self.admin(admin).await?)
+    }
+
+    /// Flush the buffers of the log to the operating system, and with `sync` to disk.
+    pub async fn flush_wal(&self, sync: bool) -> Result<()> {
+        done(self.admin(Admin::FlushWal { sync }).await?)
+    }
+
+    /// What recovering the log did when the owner opened the database.
+    pub async fn recovery_report(&self) -> Result<WalRecoveryReport> {
+        match self.admin(Admin::RecoveryReport).await? {
+            Reply::Recovery(recovery) => Ok(recovery.into()),
+            other => Err(out_of_turn(Answer::Admin(other))),
+        }
+    }
+
+    /// The error of SurrealKV's background work, if there is one.
+    pub async fn background_error(&self) -> Result<Option<BackgroundError>> {
+        match self.admin(Admin::BackgroundError).await? {
+            Reply::BackgroundError(recorded) => recorded.map(|error| error.received()).transpose(),
+            other => Err(out_of_turn(Answer::Admin(other))),
+        }
+    }
+
+    /// How many errors SurrealKV's background work has met.
+    pub async fn background_error_count(&self) -> Result<u64> {
+        match self.admin(Admin::BackgroundErrorCount).await? {
+            Reply::Count(count) => Ok(count),
+            other => Err(out_of_turn(Answer::Admin(other))),
+        }
+    }
+
+    /// Whether SurrealKV stopped the database for an error it cannot recover from.
+    pub async fn is_stopped(&self) -> Result<bool> {
+        match self.admin(Admin::IsStopped).await? {
+            Reply::Flag(stopped) => Ok(stopped),
+            other => Err(out_of_turn(Answer::Admin(other))),
+        }
+    }
+
+    /// Ask the owner's key manager again for the keys the database uses. Hidden, as
+    /// SurrealKV hides it.
+    #[doc(hidden)]
+    pub async fn prepare_keys(&self) -> Result<()> {
+        done(self.admin(Admin::PrepareKeys).await?)
+    }
+
+    /// Whether the database is encrypted, and which keys cover what, as the owner's key
+    /// manager says. Hidden, as SurrealKV hides it.
+    #[doc(hidden)]
+    pub async fn encryption_status(&self) -> Result<EncryptionStatus> {
+        match self.admin(Admin::EncryptionStatus).await? {
+            Reply::Encryption(status) => status.received(),
+            other => Err(out_of_turn(Answer::Admin(other))),
+        }
+    }
+
+    /// End the tree as a crash does: an owner abandons SurrealKV, which releases the
+    /// lock and flushes nothing, and stops serving at once; a client lets its connection
+    /// go. Hidden, as SurrealKV hides it: it is for tests of what follows a crash.
+    #[doc(hidden)]
+    pub async fn abandon(&self) {
+        self.inner.closed.store(true, Ordering::Release);
+        if let Some(Current {
+            role: Role::Owner(owner),
+            ..
+        }) = self.inner.current.lock().await.take()
+        {
+            owner.abandon();
+        }
+    }
+
+    /// Run `admin`: in this process when it owns the database, in the owner otherwise.
+    /// A client waits for an operation that takes long for as long as it takes.
+    async fn admin(&self, admin: Admin) -> Result<Reply> {
+        match self.inner.route().await? {
+            Route::Local { tree, .. } => Ok(run_blocking(tree, admin).await?),
+            Route::Remote {
+                connection,
+                owner_pid,
+                generation,
+            } => {
+                let within = (!admin.takes_long()).then_some(self.inner.call_within);
+                let call = connection.call(Request::Admin(admin));
+                match self.inner.wait(generation, owner_pid, call, within).await? {
+                    Answer::Admin(reply) => Ok(reply),
+                    other => Err(out_of_turn(other)),
+                }
+            }
+        }
+    }
+}
+
+/// The end of an operation that answers nothing but that it is done.
+fn done(reply: Reply) -> Result<()> {
+    match reply {
+        Reply::Done => Ok(()),
+        other => Err(out_of_turn(Answer::Admin(other))),
     }
 }
 

@@ -45,8 +45,8 @@ async fn example() -> kvshare::Result<()> {
 | S0 | This repository, with the spike's code split into modules | done |
 | S1 | `TreeBuilder`, `Tree`, `Transaction` with SurrealKV's names; point reads and writes, savepoints, commit and rollback | done |
 | S2 | Cursors with `seek`, `next`, `prev`; history | done |
-| S3 | `Tree`'s administrative operations through the owner | next |
-| S4 | Robustness, Linux, documentation | |
+| S3 | `Tree`'s administrative operations through the owner | done |
+| S4 | Robustness, a cursor over keys only, Linux, documentation | next |
 
 ## Boundaries
 
@@ -81,7 +81,11 @@ the transaction sees.
 | `LSMIterator`: `value_encoded`, `reanchor_first`, `reanchor_last` | none | a client has the values resolved; the re-anchors serve SurrealKV's merging iterators |
 | `KeyRange`, `ReadOptions::from_range` | the same | kvshare's own: SurrealKV keeps `KeyRange` in a private module |
 | `HistoryOptions`, `InternalKeyKind` | the same | SurrealKV's |
-| `Tree::create_checkpoint` and the other administrative operations | none yet | S3 |
+| `Tree::view` | the same, `async` | the closure is `async` too, as reads are |
+| `Tree::create_checkpoint`, `restore_from_checkpoint` | the same, `async` | a relative path is the caller's, made absolute before the owner sees it; the owner's process writes the files; `CheckpointMetadata` is kvshare's, as SurrealKV keeps its own in a private module |
+| `Tree::compact_range`, `flush_wal` | the same, `async` | `CompactRangeOptions` is SurrealKV's |
+| `Tree::recovery_report`, `background_error`, `background_error_count`, `is_stopped` | the same, `async`, in a `Result` | the owner's; `BackgroundError` is kvshare's, as SurrealKV's cannot be built by others, and its `timestamp` is on the caller's clock |
+| `Tree::prepare_keys`, `encryption_status`, `abandon` | the same, `async` | hidden, as SurrealKV hides them; the owner's key manager answers; `abandon` ends an owner as a crash does |
 
 kvshare adds:
 
@@ -133,7 +137,12 @@ clients see the same error for the same operation; SurrealKV's other errors are
 - A range or a history whose start lies past its end is empty. SurrealKV 1.4.0 panics
   on one once the transaction holds a write, and a client must not bring down the
   owner's task.
-- A cursor reads each value of its page, even if only keys are looked at.
+- `recovery_report`, `background_error`, `background_error_count` and `is_stopped`
+  answer in a `Result`: the owner may not answer.
+- A client waits for a checkpoint, a restore, a compaction or an encryption status as
+  long as it takes, without the call timeout: they copy, rewrite or read files.
+- A cursor reads each value of its page, even if only keys are looked at (a cursor over
+  keys only is planned for S4).
 - Finding an entry again for the next page steps through the versions of its key, so a
   history of a key with very many versions read in small pages reads them repeatedly.
 
@@ -154,6 +163,13 @@ answer, a value or an error, to be the same.
 - `InternalKeyRef::with_timestamp` is crate-private, so no one else can make a key that
   carries its time; kvshare's `InternalKeyRef` reads the key with SurrealKV's and keeps
   the time beside it.
+- `CheckpointMetadata` lies in a private module, and `BackgroundError`, `EncryptionStatus`,
+  `KeyUsage` and `FileTotals` are `#[non_exhaustive]`: kvshare has its own, with the
+  same fields.
+
+A restore with a transaction open goes as in SurrealKV, which `tests/differential.rs`
+pins: the transaction reads the restored database from then on, with its own writes,
+and what it commits lands on it.
 
 ## What was measured
 
@@ -185,9 +201,12 @@ wait for the owner.
 cargo test
 ```
 
-- `tests/differential.rs`: the same scenarios on SurrealKV, an owner and a client.
+- `tests/differential.rs`: the same scenarios on SurrealKV, an owner and a client,
+  among them every operation on the whole database and a restore with a transaction
+  open.
 - `tests/handover.rs`: the election, hand-over, conflicts, a client's own writes, many
-  tasks of one client, a client that leaves, the bound on open transactions.
+  tasks of one client, a client that leaves, an owner that crashes, the bound on open
+  transactions.
 - `tests/scan.rs`: cursors over ranges and histories in pages, the same in the owner
   and through the socket; a reversed range; a history of a tree without versions; a
   cursor moved in a spawned task.

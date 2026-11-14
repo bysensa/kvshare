@@ -8,26 +8,154 @@
 
 mod common;
 
+use std::path::Path;
+
 use common::{base, builder, close, owner_and_client};
-use kvshare::{Durability, Error, HistoryOptions, Mode, ReadOptions, WriteOptions};
+use kvshare::{
+    CompactRangeOptions, Durability, Error, HistoryOptions, Mode, ReadOptions, WriteOptions,
+};
 use surrealkv::LSMIterator;
 
-/// A database under test, and for kvshare the size of its cursors' pages.
+/// A database under test, its directory, and for kvshare the size of its cursors' pages.
 enum Db<'a> {
-    Plain(&'a surrealkv::Tree),
-    Shared(&'a kvshare::Tree, usize),
+    Plain(&'a surrealkv::Tree, &'a Path),
+    Shared(&'a kvshare::Tree, usize, &'a Path),
 }
 
 impl Db<'_> {
     async fn begin(&self, mode: Mode) -> Tx {
         match self {
-            Db::Plain(tree) => Tx::Plain(tree.begin_with_mode(mode).expect("a transaction")),
-            Db::Shared(tree, page) => Tx::Shared(
+            Db::Plain(tree, _) => Tx::Plain(tree.begin_with_mode(mode).expect("a transaction")),
+            Db::Shared(tree, page, _) => Tx::Shared(
                 tree.begin_with_mode(mode).await.expect("a transaction"),
                 *page,
             ),
         }
     }
+
+    fn path(&self) -> &Path {
+        match self {
+            Db::Plain(_, path) | Db::Shared(_, _, path) => path,
+        }
+    }
+
+    async fn create_checkpoint(&self, dir: &Path) -> String {
+        match self {
+            Db::Plain(tree, _) => {
+                said(plain(tree.create_checkpoint(dir)).map(|m| {
+                    checkpoint(m.version, m.sequence_number, m.sstable_count, m.total_size)
+                }))
+            }
+            Db::Shared(tree, ..) => {
+                said(tree.create_checkpoint(dir).await.map(|m| {
+                    checkpoint(m.version, m.sequence_number, m.sstable_count, m.total_size)
+                }))
+            }
+        }
+    }
+
+    async fn restore_from_checkpoint(&self, dir: &Path) -> String {
+        match self {
+            Db::Plain(tree, _) => {
+                said(plain(tree.restore_from_checkpoint(dir)).map(|m| {
+                    checkpoint(m.version, m.sequence_number, m.sstable_count, m.total_size)
+                }))
+            }
+            Db::Shared(tree, ..) => {
+                said(tree.restore_from_checkpoint(dir).await.map(|m| {
+                    checkpoint(m.version, m.sequence_number, m.sstable_count, m.total_size)
+                }))
+            }
+        }
+    }
+
+    async fn compact_range(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        options: &CompactRangeOptions,
+    ) -> String {
+        match self {
+            Db::Plain(tree, _) => said(plain(tree.compact_range(start, end, options))),
+            Db::Shared(tree, ..) => said(tree.compact_range(start, end, options).await),
+        }
+    }
+
+    async fn flush_wal(&self, sync: bool) -> String {
+        match self {
+            Db::Plain(tree, _) => said(plain(tree.flush_wal(sync))),
+            Db::Shared(tree, ..) => said(tree.flush_wal(sync).await),
+        }
+    }
+
+    /// The recovery report, whether a background error is recorded, how many were, and
+    /// whether the database stopped.
+    async fn health(&self) -> String {
+        match self {
+            Db::Plain(tree, _) => format!(
+                "{:?} error={:?} count={} stopped={}",
+                tree.recovery_report(),
+                tree.background_error().map(|error| error.reason),
+                tree.background_error_count(),
+                tree.is_stopped()
+            ),
+            Db::Shared(tree, ..) => format!(
+                "{:?} error={:?} count={} stopped={}",
+                tree.recovery_report().await.expect("a report"),
+                tree.background_error()
+                    .await
+                    .expect("an answer")
+                    .map(|error| error.reason),
+                tree.background_error_count().await.expect("a count"),
+                tree.is_stopped().await.expect("an answer")
+            ),
+        }
+    }
+
+    async fn prepare_keys(&self) -> String {
+        match self {
+            Db::Plain(tree, _) => said(plain(tree.prepare_keys())),
+            Db::Shared(tree, ..) => said(tree.prepare_keys().await),
+        }
+    }
+
+    /// The encryption status, as its fields print.
+    async fn encryption_status(&self) -> String {
+        match self {
+            Db::Plain(tree, _) => match tree.encryption_status() {
+                Ok(status) => format!("ok {status:?}"),
+                Err(error) => format!("err {:?}", Error::from(error)),
+            },
+            Db::Shared(tree, ..) => match tree.encryption_status().await {
+                Ok(status) => format!("ok {status:?}"),
+                Err(error) => format!("err {error:?}"),
+            },
+        }
+    }
+
+    /// What `view` reads of `key`.
+    async fn view(&self, key: &[u8]) -> String {
+        let mut seen = None;
+        let answer = match self {
+            Db::Plain(tree, _) => plain(tree.view(|tx| {
+                seen = tx.get(key)?;
+                Ok(())
+            })),
+            Db::Shared(tree, ..) => {
+                tree.view(async |tx| {
+                    seen = tx.get(key).await?;
+                    Ok(())
+                })
+                .await
+            }
+        };
+        said(answer.map(|()| seen))
+    }
+}
+
+/// A checkpoint as the record shows it: not its time, which is the clock's.
+fn checkpoint(version: u32, sequence: u64, tables: usize, bytes: u64) -> String {
+    format!("v{version} seq={sequence} tables={tables} bytes={bytes}")
 }
 
 /// A transaction under test.
@@ -81,6 +209,12 @@ impl Shown for Vec<Option<Vec<u8>>> {
 impl Shown for Vec<String> {
     fn shown(self) -> String {
         self.join(" ")
+    }
+}
+
+impl Shown for String {
+    fn shown(self) -> String {
+        self
     }
 }
 
@@ -487,24 +621,25 @@ impl Tx {
 async fn compare(name: &str, pages: &[usize], scenario: impl AsyncFn(&Db<'_>) -> Vec<String>) {
     let base = base(&format!("d-{name}"));
 
+    let path = base.join("p");
     let tree = surrealkv::TreeBuilder::new()
-        .with_path(base.join("p"))
+        .with_path(path.clone())
         .with_versioning(true, 0)
         .build()
         .expect("SurrealKV opens");
-    let expected = scenario(&Db::Plain(&tree)).await;
+    let expected = scenario(&Db::Plain(&tree, &path)).await;
     tree.close().await.expect("SurrealKV closes");
     eprintln!("{name}, as SurrealKV answers:\n  {}", expected.join("\n  "));
 
     for (n, &page) in pages.iter().enumerate() {
         let alone = base.join(format!("o{n}"));
         let owner = builder(&alone).build().await.expect("the owner");
-        let local = scenario(&Db::Shared(&owner, page)).await;
+        let local = scenario(&Db::Shared(&owner, page, &alone.join("db"))).await;
         owner.close().await.expect("the owner closes");
 
         let shared = base.join(format!("c{n}"));
         let (owner, client) = owner_and_client(&shared).await;
-        let remote = scenario(&Db::Shared(&client, page)).await;
+        let remote = scenario(&Db::Shared(&client, page, &shared.join("db"))).await;
         close(owner, client, &shared).await;
 
         for (record, who) in [
@@ -1077,6 +1212,92 @@ async fn history(db: &Db<'_>) -> Vec<String> {
     let mut wo = db.begin(Mode::WriteOnly).await;
     walks(&mut log, &mut wo, vec![("wo", all(), vec![First])]).await;
     log
+}
+
+/// Operations on the whole database, and a restore while a transaction is open: what the
+/// transaction reads and commits after it, and what a new one reads.
+async fn admin(db: &Db<'_>) -> Vec<String> {
+    let mut log = Vec::new();
+    let mut seed = db.begin(Mode::ReadWrite).await;
+    log.push(seed.set(b"a", b"A"));
+    log.push(seed.set(b"b", b"B"));
+    log.push(seed.commit().await);
+
+    log.push(format!("flush: {}", db.flush_wal(false).await));
+    log.push(format!("flush and sync: {}", db.flush_wal(true).await));
+    log.push(format!("health: {}", db.health().await));
+    log.push(format!("keys: {}", db.prepare_keys().await));
+    log.push(format!("encryption: {}", db.encryption_status().await));
+    log.push(format!("view: {}", db.view(b"a").await));
+    let all = CompactRangeOptions::default();
+    log.push(format!(
+        "compact all: {}",
+        db.compact_range(None, None, &all).await
+    ));
+    log.push(format!(
+        "compact backwards: {}",
+        db.compact_range(Some(b"z"), Some(b"a"), &all).await
+    ));
+    let shallow = CompactRangeOptions {
+        flush_memtable: false,
+        target_level: Some(1),
+        rewrite_bottommost: false,
+    };
+    log.push(format!(
+        "compact a..b to level 1: {}",
+        db.compact_range(Some(b"a"), Some(b"b"), &shallow).await
+    ));
+
+    // SurrealKV's errors name the paths, which differ from one database to another.
+    let anonymous = |line: String| line.replace(&db.path().display().to_string(), "<db>");
+    let saved = db.path().with_extension("ckpt");
+    log.push(format!(
+        "checkpoint: {}",
+        db.create_checkpoint(&saved).await
+    ));
+    log.push(anonymous(format!(
+        "checkpoint into the database: {}",
+        db.create_checkpoint(db.path()).await
+    )));
+    log.push(anonymous(format!(
+        "checkpoint inside the database: {}",
+        db.create_checkpoint(&db.path().join("inside")).await
+    )));
+
+    let mut later = db.begin(Mode::ReadWrite).await;
+    log.push(later.set(b"c", b"C"));
+    log.push(later.delete(b"a"));
+    log.push(later.commit().await);
+
+    let mut open = db.begin(Mode::ReadWrite).await;
+    log.push(format!("open reads: {}", open.get(b"c").await));
+    log.push(open.set(b"t", b"T"));
+    log.push(format!(
+        "restore: {}",
+        db.restore_from_checkpoint(&saved).await
+    ));
+    log.push(format!(
+        "open after: {}",
+        open.range(b"a", b"z", false).await
+    ));
+    log.push(format!("open reads a: {}", open.get(b"a").await));
+    log.push(format!("open commits: {}", open.commit().await));
+    let mut after = db.begin(Mode::ReadOnly).await;
+    log.push(format!(
+        "new after: {}",
+        after.range(b"a", b"z", false).await
+    ));
+    log.push(anonymous(format!(
+        "restore from nothing: {}",
+        db.restore_from_checkpoint(&db.path().with_extension("none"))
+            .await
+    )));
+    log
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_is_the_same() {
+    compare("admin", &[2], admin).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

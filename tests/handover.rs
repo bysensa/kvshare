@@ -178,6 +178,41 @@ async fn a_client_that_leaves_does_not_close_the_owners_database() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// An owner that ends as a crash does leaves the database to its client, which elects
+/// itself and finds every commit that returned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_takes_over_from_an_owner_that_crashes() {
+    let base = base("abandon");
+    let (owner, client) = owner_and_client(&base).await;
+    {
+        let mut tx = client.begin().await.expect("a remote transaction");
+        tx.set(b"k", b"before the crash").expect("a write");
+        tx.commit().await.expect("a commit through the owner");
+    }
+    owner.abandon().await;
+    assert!(
+        owner.begin().await.is_err(),
+        "an abandoned tree begins nothing"
+    );
+
+    let (tx, value) = loop {
+        let attempt = async {
+            let tx = client.begin().await?;
+            let value = tx.get(b"k").await?;
+            Ok::<_, Error>((tx, value))
+        };
+        match attempt.await {
+            Ok(done) => break done,
+            Err(Error::OwnerLost(_)) => continue,
+            Err(other) => panic!("the client could not take over: {other}"),
+        }
+    };
+    assert!(tx.is_local(), "the client became the owner");
+    assert_eq!(value.as_deref(), Some(&b"before the crash"[..]));
+    drop(tx);
+    close(owner, client, &base).await;
+}
+
 /// A client opens only as many transactions at once as the owner allows; one more is
 /// refused on its first request, and the others still work.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

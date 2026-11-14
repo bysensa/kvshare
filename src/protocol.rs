@@ -34,11 +34,12 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
+use crate::admin::{Admin, Reply};
 use crate::error::KvError;
 use crate::types::{WireDurability, WireMode};
 
 /// The version of the protocol. Bump it when a message would mean something else.
-pub const VERSION: u32 = 5;
+pub const VERSION: u32 = 6;
 
 /// How many transactions one connection may hold open at once.
 pub const MAX_TRANSACTIONS: usize = 64;
@@ -284,6 +285,8 @@ pub(crate) enum Request {
     },
     /// Roll transaction `tx` back. It has no answer.
     Rollback { tx: TxId },
+    /// An operation on the whole database.
+    Admin(Admin),
 }
 
 /// What the owner answers a request.
@@ -297,6 +300,8 @@ pub(crate) enum Answer {
         more: bool,
     },
     Committed,
+    /// What an operation on the whole database answered.
+    Admin(Reply),
     Failed(KvError),
 }
 

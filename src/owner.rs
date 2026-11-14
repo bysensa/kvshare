@@ -12,6 +12,7 @@ use tokio::io::BufReader;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::task::{JoinHandle, JoinSet};
 
+use crate::admin::run_blocking;
 use crate::endpoint::Endpoint;
 use crate::error::KvError;
 use crate::exec::{apply, page};
@@ -73,6 +74,14 @@ impl Owner {
         &self.tree
     }
 
+    /// Let the database go as a crash does: stop serving at once and abandon SurrealKV,
+    /// which releases the lock and flushes nothing. The socket file stays, as after a
+    /// crash, and the next owner removes it.
+    pub(crate) fn abandon(self) {
+        self.accept.abort();
+        self.tree.abandon();
+    }
+
     /// Hand the database over: stop serving, remove the socket and close the tree.
     ///
     /// The clients lose their connections, their open transactions are rolled back,
@@ -106,10 +115,11 @@ async fn accept(listener: UnixListener, tree: Arc<Tree>, welcome: Arc<Welcome>) 
 /// Welcome the client of `stream`, then answer its requests until it goes away.
 ///
 /// Requests are handled in their order, so a transaction a client begins without
-/// waiting is open before its next request. A commit runs in a task of its own, so a
-/// commit that waits for a sync does not hold up the client's other requests. When the
-/// client goes away, its table is dropped, which rolls back what it left open, and the
-/// commits already started run to their end.
+/// waiting is open before its next request. A commit, and an operation on the whole
+/// database, runs in a task of its own, so one that waits for a sync or copies files does
+/// not hold up the client's other requests. When the client goes away, its table is
+/// dropped, which rolls back what it left open, and the work already started runs to its
+/// end.
 async fn serve(stream: UnixStream, tree: Arc<Tree>, welcome: Arc<Welcome>) {
     let (read, write) = stream.into_split();
     let writer = Arc::new(tokio::sync::Mutex::new(write));
@@ -125,7 +135,7 @@ async fn serve(stream: UnixStream, tree: Arc<Tree>, welcome: Arc<Welcome>) {
         tree,
         open: HashMap::new(),
     };
-    let mut commits = JoinSet::new();
+    let mut running = JoinSet::new();
     while let Ok((id, request)) = read_frame::<_, (RequestId, Request)>(&mut reader).await {
         let answer = match request {
             Request::Begin {
@@ -191,7 +201,7 @@ async fn serve(stream: UnixStream, tree: Arc<Tree>, welcome: Arc<Welcome>) {
             } => match table.prepare(tx, writes, durability) {
                 Ok(mut transaction) => {
                     let writer = Arc::clone(&writer);
-                    commits.spawn(async move {
+                    running.spawn(async move {
                         let answer = match transaction.commit().await {
                             Ok(()) => Answer::Committed,
                             Err(error) => Answer::Failed(error.into()),
@@ -203,6 +213,17 @@ async fn serve(stream: UnixStream, tree: Arc<Tree>, welcome: Arc<Welcome>) {
                 }
                 Err(error) => Err(error),
             },
+            Request::Admin(admin) => {
+                let (tree, writer) = (Arc::clone(&table.tree), Arc::clone(&writer));
+                running.spawn(async move {
+                    let answer = match run_blocking(tree, admin).await {
+                        Ok(reply) => Answer::Admin(reply),
+                        Err(error) => Answer::Failed(error),
+                    };
+                    let _ = write_frame(&mut *writer.lock().await, &(id, answer)).await;
+                });
+                continue;
+            }
         };
         let answer = answer.unwrap_or_else(Answer::Failed);
         if write_frame(&mut *writer.lock().await, &(id, answer))
@@ -211,10 +232,10 @@ async fn serve(stream: UnixStream, tree: Arc<Tree>, welcome: Arc<Welcome>) {
         {
             break;
         }
-        while commits.try_join_next().is_some() {}
+        while running.try_join_next().is_some() {}
     }
     drop(table);
-    while commits.join_next().await.is_some() {}
+    while running.join_next().await.is_some() {}
 }
 
 /// A transaction of a client, or why it could not begin: the reason comes back on the
