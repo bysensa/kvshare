@@ -5,83 +5,65 @@
 mod common;
 
 use common::{base, close, owner_and_client};
-use kvshare::protocol::Durability;
-use kvshare::{Shared, Version};
+use kvshare::{Tree, Version};
 
 /// The ten keys `k00`..`k09` the range tests read.
 fn ten_keys() -> Vec<String> {
     (0..10).map(|n| format!("k{n:02}")).collect()
 }
 
-/// Commit `k00`..`k09` through `shared`, each with the value `v` and its number.
-async fn write_ten_keys(shared: &Shared) {
-    let mut tx = shared
-        .begin(Durability::Eventual)
-        .await
-        .expect("a transaction");
+/// Commit `k00`..`k09` through `tree`, each with the value `v` and its number.
+async fn write_ten_keys(tree: &Tree) {
+    let mut tx = tree.begin().await.expect("a transaction");
     for key in ten_keys() {
         let value = key.replace('k', "v");
-        tx.set(key.as_bytes(), value.as_bytes())
-            .await
-            .expect("a write");
+        tx.set(key.as_bytes(), value.as_bytes()).expect("a write");
     }
     tx.commit().await.expect("a commit");
 }
 
-/// Every entry of `[start, end)` that a new transaction of `shared` sees, read in pages
+/// Every entry of `[start, end)` that a new transaction of `tree` sees, read in pages
 /// of `page` entries.
 async fn range(
-    shared: &Shared,
+    tree: &Tree,
     start: &[u8],
     end: &[u8],
     reverse: bool,
     page: usize,
 ) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let mut tx = shared
-        .begin(Durability::Eventual)
-        .await
-        .expect("a transaction");
+    let mut tx = tree.begin().await.expect("a transaction");
     let mut entries = Vec::new();
-    {
-        let mut scan = tx.range(start, end).page(page);
-        if reverse {
-            scan = scan.reverse();
-        }
-        while let Some(entry) = scan.next().await.expect("a page") {
-            entries.push(entry);
-        }
+    let mut scan = tx.range(start, end).page(page);
+    if reverse {
+        scan = scan.reverse();
     }
-    tx.rollback().await.expect("a rollback");
+    while let Some(entry) = scan.next().await.expect("a page") {
+        entries.push(entry);
+    }
     entries
 }
 
-/// Every version of the keys of `[start, end)` that a new transaction of `shared` sees,
+/// Every version of the keys of `[start, end)` that a new transaction of `tree` sees,
 /// read in pages of `page` versions, with tombstones or not, between two times or not.
 async fn history(
-    shared: &Shared,
+    tree: &Tree,
     (start, end): (&[u8], &[u8]),
     tombstones: bool,
     between: Option<(u64, u64)>,
     page: usize,
 ) -> Vec<Version> {
-    let mut tx = shared
-        .begin(Durability::Eventual)
-        .await
-        .expect("a transaction");
+    let mut tx = tree.begin().await.expect("a transaction");
     let mut versions = Vec::new();
-    {
-        let mut read = tx.history(start, end).page(page);
-        if tombstones {
-            read = read.with_tombstones();
-        }
-        if let Some((from, to)) = between {
-            read = read.between(from, to);
-        }
-        while let Some(version) = read.next().await.expect("a page") {
-            versions.push(version);
-        }
+    let mut read = tx.history(start, end).page(page);
+    if tombstones {
+        read = read.with_tombstones();
     }
-    tx.rollback().await.expect("a rollback");
+    if let Some((from, to)) = between {
+        read = read.between(from, to);
+    }
+    while let Some(version) = read.next().await.expect("a page") {
+        versions.push(version);
+    }
     versions
 }
 
@@ -120,8 +102,8 @@ async fn a_range_reads_the_same_in_pages_in_the_owner_and_through_the_socket() {
             expected.reverse();
         }
         for page in [1, 3, 1000] {
-            for (who, shared) in [("owner", &owner), ("client", &client)] {
-                let entries = range(shared, b"k", b"l", reverse, page).await;
+            for (who, tree) in [("owner", &owner), ("client", &client)] {
+                let entries = range(tree, b"k", b"l", reverse, page).await;
                 assert_eq!(
                     keys(&entries),
                     expected,
@@ -145,13 +127,10 @@ async fn a_remote_range_sees_its_own_writes_which_others_see_after_the_commit() 
     let (owner, client) = owner_and_client(&base).await;
     write_ten_keys(&owner).await;
 
-    let mut tx = client
-        .begin(Durability::Eventual)
-        .await
-        .expect("a transaction");
-    tx.set(b"k03", b"new").await.expect("a write");
-    tx.delete(b"k05").await.expect("a delete");
-    tx.set(b"k10", b"v10").await.expect("a write");
+    let mut tx = client.begin().await.expect("a transaction");
+    tx.set(b"k03", b"new").expect("a write");
+    tx.delete(b"k05").expect("a delete");
+    tx.set(b"k10", b"v10").expect("a write");
     let mut seen = Vec::new();
     {
         let mut scan = tx.range(b"k", b"l").page(3);
@@ -194,26 +173,20 @@ async fn a_paged_remote_range_keeps_its_snapshot() {
     let (owner, client) = owner_and_client(&base).await;
     write_ten_keys(&owner).await;
 
-    let mut tx = client
-        .begin(Durability::Eventual)
-        .await
-        .expect("a transaction");
+    let mut tx = client.begin().await.expect("a transaction");
     let mut seen = Vec::new();
     {
         let mut scan = tx.range(b"k", b"l").page(2);
         seen.push(scan.next().await.expect("a page").expect("an entry"));
-        let mut later = owner
-            .begin(Durability::Eventual)
-            .await
-            .expect("a transaction");
-        later.set(b"k055", b"late").await.expect("a write");
-        later.delete(b"k08").await.expect("a delete");
+        let mut later = owner.begin().await.expect("a transaction");
+        later.set(b"k055", b"late").expect("a write");
+        later.delete(b"k08").expect("a delete");
         later.commit().await.expect("a commit");
         while let Some(entry) = scan.next().await.expect("a page") {
             seen.push(entry);
         }
     }
-    tx.rollback().await.expect("a rollback");
+    tx.rollback();
     assert_eq!(keys(&seen), ten_keys());
     close(owner, client, &base).await;
 }
@@ -233,20 +206,12 @@ async fn a_history_reads_the_same_in_pages_in_the_owner_and_through_the_socket()
         ("h1", "3"),
         ("h2", "b"),
     ] {
-        let mut tx = client
-            .begin(Durability::Eventual)
-            .await
-            .expect("a transaction");
-        tx.set(key.as_bytes(), value.as_bytes())
-            .await
-            .expect("a write");
+        let mut tx = client.begin().await.expect("a transaction");
+        tx.set(key.as_bytes(), value.as_bytes()).expect("a write");
         tx.commit().await.expect("a commit");
     }
-    let mut tx = client
-        .begin(Durability::Eventual)
-        .await
-        .expect("a transaction");
-    tx.soft_delete(b"h1").await.expect("a soft delete");
+    let mut tx = client.begin().await.expect("a transaction");
+    tx.soft_delete(b"h1").expect("a soft delete");
     tx.commit().await.expect("a commit");
 
     let range = (&b"h"[..], &b"i"[..]);
@@ -269,12 +234,45 @@ async fn a_history_reads_the_same_in_pages_in_the_owner_and_through_the_socket()
     assert_eq!(shown(&between), ["h1=3", "h1=2", "h2=a"]);
 
     for page in [1, 2, 4, 1000] {
-        for (who, shared) in [("owner", &owner), ("client", &client)] {
-            let read = history(shared, range, true, None, page).await;
+        for (who, tree) in [("owner", &owner), ("client", &client)] {
+            let read = history(tree, range, true, None, page).await;
             assert_eq!(read, all, "{who}, page {page}, with tombstones");
-            let read = history(shared, range, false, window, page).await;
+            let read = history(tree, range, false, window, page).await;
             assert_eq!(read, between, "{who}, page {page}, between");
         }
+    }
+    close(owner, client, &base).await;
+}
+
+/// A range whose start lies past its end holds no key, and reading it, or its history,
+/// answers nothing, in the owner and through the socket, even with writes pending, where
+/// SurrealKV itself panics.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_range_with_its_bounds_reversed_is_empty() {
+    let base = base("reversed");
+    let (owner, client) = owner_and_client(&base).await;
+    write_ten_keys(&owner).await;
+
+    for (who, tree) in [("owner", &owner), ("client", &client)] {
+        let mut tx = tree.begin().await.expect("a transaction");
+        tx.set(b"k05", b"pending").expect("a write");
+        for reverse in [false, true] {
+            let mut scan = tx.range(b"l", b"k").page(3);
+            if reverse {
+                scan = scan.reverse();
+            }
+            assert_eq!(scan.next().await.expect("a page"), None, "{who}, {reverse}");
+        }
+        let mut read = tx.history(b"l", b"k").with_tombstones();
+        assert_eq!(read.next().await.expect("a page"), None, "{who}, history");
+        assert_eq!(
+            tx.get(b"k05")
+                .await
+                .expect("the transaction still works")
+                .as_deref(),
+            Some(&b"pending"[..]),
+            "{who}"
+        );
     }
     close(owner, client, &base).await;
 }
@@ -285,23 +283,17 @@ async fn a_hard_delete_takes_the_history_with_it() {
     let base = base("hard-delete");
     let (owner, client) = owner_and_client(&base).await;
     for value in ["1", "2"] {
-        let mut tx = client
-            .begin(Durability::Eventual)
-            .await
-            .expect("a transaction");
-        tx.set(b"x", value.as_bytes()).await.expect("a write");
+        let mut tx = client.begin().await.expect("a transaction");
+        tx.set(b"x", value.as_bytes()).expect("a write");
         tx.commit().await.expect("a commit");
     }
-    let mut tx = client
-        .begin(Durability::Eventual)
-        .await
-        .expect("a transaction");
-    tx.delete(b"x").await.expect("a delete");
+    let mut tx = client.begin().await.expect("a transaction");
+    tx.delete(b"x").expect("a delete");
     tx.commit().await.expect("a commit");
 
-    for shared in [&owner, &client] {
+    for tree in [&owner, &client] {
         assert!(
-            history(shared, (b"x", b"y"), false, None, 1000)
+            history(tree, (b"x", b"y"), false, None, 1000)
                 .await
                 .is_empty()
         );
@@ -315,18 +307,12 @@ async fn a_hard_delete_takes_the_history_with_it() {
 async fn a_remote_history_sees_its_own_pending_write() {
     let base = base("pending-history");
     let (owner, client) = owner_and_client(&base).await;
-    let mut tx = owner
-        .begin(Durability::Eventual)
-        .await
-        .expect("a transaction");
-    tx.set(b"h", b"old").await.expect("a write");
+    let mut tx = owner.begin().await.expect("a transaction");
+    tx.set(b"h", b"old").expect("a write");
     tx.commit().await.expect("a commit");
 
-    let mut tx = client
-        .begin(Durability::Eventual)
-        .await
-        .expect("a transaction");
-    tx.set(b"h", b"new").await.expect("a write");
+    let mut tx = client.begin().await.expect("a transaction");
+    tx.set(b"h", b"new").expect("a write");
     let mut versions = Vec::new();
     {
         let mut read = tx.history(b"h", b"i");
@@ -336,7 +322,7 @@ async fn a_remote_history_sees_its_own_pending_write() {
     }
     assert_eq!(shown(&versions), ["h=new", "h=old"]);
     assert_eq!(versions[0].timestamp, u64::MAX);
-    tx.rollback().await.expect("a rollback");
+    tx.rollback();
 
     let after = history(&owner, (b"h", b"i"), false, None, 1000).await;
     assert_eq!(shown(&after), ["h=old"], "the rolled back write is gone");

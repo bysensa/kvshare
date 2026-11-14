@@ -8,8 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use kvshare::protocol::Durability;
-use kvshare::{Options, Shared};
+use kvshare::{Durability, Tree, TreeBuilder};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::UnixStream;
 use tokio::process::Command;
@@ -30,7 +29,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = std::fs::remove_dir_all(&base);
     let run_dir = base.join("run");
 
-    let local = Shared::new(&base.join("local"), Options::new(&run_dir))?;
+    let local = open(base.join("local"), &run_dir).await?;
     let in_process = measure(&local, iterations).await?;
     local.close().await?;
 
@@ -48,7 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .read_line(&mut said)
         .await?;
     assert_eq!(said.trim(), "owner", "the child process owns the database");
-    let remote = Shared::new(&remote_db, Options::new(&run_dir))?;
+    let remote = open(remote_db, &run_dir).await?;
     assert_eq!(
         remote.owner_pid().await?,
         owner.id().expect("a running owner"),
@@ -119,52 +118,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Time each operation on `shared`, after writing the keys it reads.
+/// Open the database at `db`, which elects at once.
+async fn open(db: PathBuf, run_dir: &Path) -> Result<Tree, kvshare::Error> {
+    TreeBuilder::new()
+        .with_path(db)
+        .with_versioning(true, 0)
+        .with_run_dir(run_dir.to_path_buf())
+        .build()
+        .await
+}
+
+/// Time each operation on `tree`, after writing the keys it reads.
 async fn measure(
-    shared: &Shared,
+    tree: &Tree,
     iterations: usize,
 ) -> Result<Vec<(&'static str, Vec<Duration>)>, kvshare::Error> {
     let keys: Vec<Vec<u8>> = (0..KEYS)
         .map(|n| format!("key-{n:06}").into_bytes())
         .collect();
-    let mut tx = shared.begin(Durability::Eventual).await?;
+    let mut tx = tree.begin().await?;
     for key in &keys {
-        tx.set(key, &[7u8; 100]).await?;
+        tx.set(key, &[7u8; 100])?;
     }
     tx.commit().await?;
 
     let mut get = Vec::with_capacity(iterations);
-    let mut tx = shared.begin(Durability::Eventual).await?;
-    // The first read begins the transaction in the owner; the rest are the ones timed.
+    let tx = tree.begin().await?;
+    // The first read waits for the owner to open the transaction; the rest are timed.
     tx.get(&keys[0]).await?;
     for n in 0..iterations {
         let started = Instant::now();
         tx.get(&keys[n % KEYS]).await?;
         get.push(started.elapsed());
     }
-    tx.rollback().await?;
+    drop(tx);
 
     let mut read = Vec::with_capacity(iterations);
     for n in 0..iterations {
         let started = Instant::now();
-        let mut tx = shared.begin(Durability::Eventual).await?;
+        let mut tx = tree.begin().await?;
         tx.get(&keys[n % KEYS]).await?;
-        tx.rollback().await?;
+        tx.rollback();
         read.push(started.elapsed());
-    }
-
-    let mut get_at = Vec::with_capacity(iterations);
-    for n in 0..iterations {
-        let started = Instant::now();
-        shared.get_at(&keys[n % KEYS], u64::MAX).await?;
-        get_at.push(started.elapsed());
     }
 
     let mut eventual = Vec::with_capacity(iterations);
     for n in 0..iterations {
         let started = Instant::now();
-        let mut tx = shared.begin(Durability::Eventual).await?;
-        tx.set(&keys[n % KEYS], &[8u8; 100]).await?;
+        let mut tx = tree.begin().await?;
+        tx.set(&keys[n % KEYS], &[8u8; 100])?;
         tx.commit().await?;
         eventual.push(started.elapsed());
     }
@@ -172,8 +174,8 @@ async fn measure(
     let mut immediate = Vec::with_capacity(iterations / 20);
     for n in 0..iterations / 20 {
         let started = Instant::now();
-        let mut tx = shared.begin(Durability::Immediate).await?;
-        tx.set(&keys[n % KEYS], &[9u8; 100]).await?;
+        let mut tx = tree.begin().await?.with_durability(Durability::Immediate);
+        tx.set(&keys[n % KEYS], &[9u8; 100])?;
         tx.commit().await?;
         immediate.push(started.elapsed());
     }
@@ -181,9 +183,9 @@ async fn measure(
     let mut update = Vec::with_capacity(iterations);
     for n in 0..iterations {
         let started = Instant::now();
-        let mut tx = shared.begin(Durability::Eventual).await?;
+        let mut tx = tree.begin().await?;
         tx.get(&keys[n % KEYS]).await?;
-        tx.set(&keys[n % KEYS], &[10u8; 100]).await?;
+        tx.set(&keys[n % KEYS], &[10u8; 100])?;
         tx.commit().await?;
         update.push(started.elapsed());
     }
@@ -192,7 +194,7 @@ async fn measure(
     let mut scan = Vec::with_capacity(iterations / 20);
     for _ in 0..iterations / 20 {
         let started = Instant::now();
-        let mut tx = shared.begin(Durability::Eventual).await?;
+        let mut tx = tree.begin().await?;
         let mut read = 0;
         {
             let mut entries = tx.range(b"key-", b"key.");
@@ -200,7 +202,7 @@ async fn measure(
                 read += 1;
             }
         }
-        tx.rollback().await?;
+        tx.rollback();
         scan.push(started.elapsed());
         assert_eq!(read, KEYS, "the scan reads every key");
     }
@@ -208,7 +210,6 @@ async fn measure(
     Ok(vec![
         ("get in an open transaction", get),
         ("read: begin + get + rollback", read),
-        ("get_at (a read of its own)", get_at),
         ("write: begin + set + commit, Eventual", eventual),
         ("write: begin + set + commit, Immediate", immediate),
         ("update: get + set + commit, Eventual", update),

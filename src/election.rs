@@ -8,18 +8,19 @@
 
 use std::hash::{BuildHasher, RandomState};
 use std::io;
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use surrealkv::{Tree, TreeBuilder};
+use surrealkv::{Options, Tree, TreeBuilder};
 use tokio::net::UnixStream;
 
+use crate::api::Inner;
 use crate::client::Connection;
+use crate::endpoint::Endpoint;
+use crate::error::{Error, Result};
 use crate::owner::Owner;
 use crate::protocol::VERSION;
-use crate::shared::{Error, Shared};
 
 /// This process's part in a shared database.
 pub(crate) enum Role {
@@ -36,21 +37,9 @@ pub(crate) struct Current {
     pub(crate) role: Role,
 }
 
-impl Shared {
-    /// The pid of the process that owns the database now, asked over its socket. This
-    /// process takes no part in the election and keeps no connection.
-    ///
-    /// SurrealKV's lock file is no witness: every process that tries to open the
-    /// database truncates it before it tries the lock, which erases the owner's pid.
-    pub async fn current_owner(&self) -> Result<u32, Error> {
-        Ok(self.connect().await?.1)
-    }
-
+impl Inner {
     /// The role held now, after an election if none is.
-    pub(crate) async fn held<'c>(
-        &self,
-        current: &'c mut Option<Current>,
-    ) -> Result<&'c Current, Error> {
+    pub(crate) async fn held<'c>(&self, current: &'c mut Option<Current>) -> Result<&'c Current> {
         if current.is_none() {
             let role = self.elect().await?;
             *current = Some(Current {
@@ -73,33 +62,36 @@ impl Shared {
     }
 
     /// Open the database and own it, or connect to the process that does.
-    async fn elect(&self) -> Result<Role, Error> {
+    async fn elect(&self) -> Result<Role> {
         let started = Instant::now();
         loop {
-            match open(&self.endpoint.db, self.options.versioning).await {
+            match open(&self.options).await {
                 Ok(tree) => {
-                    let owner = Owner::start(tree, &self.endpoint).map_err(Error::Io)?;
+                    let owner =
+                        Owner::start(tree, &self.endpoint, self.fingerprint).map_err(Error::Io)?;
                     return Ok(Role::Owner(owner));
                 }
-                Err(error) if is_locked(&error) => match self.connect().await {
-                    Ok((connection, owner_pid)) => {
-                        return Ok(Role::Client {
-                            connection,
-                            owner_pid,
-                        });
+                Err(error) if is_locked(&error) => {
+                    match connect(&self.endpoint, self.fingerprint, self.call_within).await {
+                        Ok((connection, owner_pid)) => {
+                            return Ok(Role::Client {
+                                connection,
+                                owner_pid,
+                            });
+                        }
+                        // The owner holds the lock but has not bound its socket yet, or
+                        // has just died and left the file: open again after a pause.
+                        Err(Error::Io(error))
+                            if matches!(
+                                error.kind(),
+                                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                            ) => {}
+                        Err(other) => return Err(other),
                     }
-                    // The owner holds the lock but has not bound its socket yet, or
-                    // has just died and left the file: open again after a pause.
-                    Err(Error::Io(error))
-                        if matches!(
-                            error.kind(),
-                            io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-                        ) => {}
-                    Err(other) => return Err(other),
-                },
+                }
                 Err(error) => return Err(error.into()),
             }
-            if started.elapsed() >= self.options.elect_within {
+            if started.elapsed() >= self.elect_within {
                 return Err(Error::NoOwner {
                     waited: started.elapsed(),
                 });
@@ -107,46 +99,48 @@ impl Shared {
             tokio::time::sleep(jitter(Duration::from_millis(5), Duration::from_millis(50))).await;
         }
     }
-
-    /// Connect to the owner's socket and check its welcome: the connection and the
-    /// owner's pid.
-    async fn connect(&self) -> Result<(Arc<Connection>, u32), Error> {
-        let stream = UnixStream::connect(&self.endpoint.socket)
-            .await
-            .map_err(Error::Io)?;
-        let (connection, welcome) = Connection::open(stream, self.options.call_within)
-            .await
-            .map_err(|error| Error::Handshake(error.to_string()))?;
-        if welcome.version != VERSION {
-            return Err(Error::Handshake(format!(
-                "the owner speaks v{}, this process v{VERSION}",
-                welcome.version
-            )));
-        }
-        if welcome.db != self.endpoint.db {
-            return Err(Error::Handshake(format!(
-                "the owner holds {}, not {}",
-                welcome.db.display(),
-                self.endpoint.db.display()
-            )));
-        }
-        Ok((Arc::new(connection), welcome.owner_pid))
-    }
 }
 
-/// Open the tree at `db`, off the async threads: opening reads and may recover files.
-async fn open(db: &Path, versioning: Option<u64>) -> surrealkv::Result<Tree> {
-    let db = db.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        let builder = TreeBuilder::new().with_path(db);
-        match versioning {
-            Some(retention_ns) => builder.with_versioning(true, retention_ns),
-            None => builder,
-        }
-        .build()
-    })
-    .await
-    .expect("opening the tree does not panic")
+/// Connect to the owner's socket of `endpoint` and check its welcome against this
+/// process: the protocol, the database and the `fingerprint` of the options that must
+/// agree. The connection and the owner's pid.
+pub(crate) async fn connect(
+    endpoint: &Endpoint,
+    fingerprint: [u8; 32],
+    within: Duration,
+) -> Result<(Arc<Connection>, u32)> {
+    let stream = UnixStream::connect(&endpoint.socket)
+        .await
+        .map_err(Error::Io)?;
+    let (connection, welcome) = Connection::open(stream, within)
+        .await
+        .map_err(|error| Error::Handshake(error.to_string()))?;
+    if welcome.version != VERSION {
+        return Err(Error::VersionMismatch {
+            owner: welcome.version,
+            this: VERSION,
+        });
+    }
+    if welcome.db != endpoint.db {
+        return Err(Error::Handshake(format!(
+            "the owner holds {}, not {}",
+            welcome.db.display(),
+            endpoint.db.display()
+        )));
+    }
+    if welcome.fingerprint != fingerprint {
+        return Err(Error::OptionsMismatch);
+    }
+    Ok((Arc::new(connection), welcome.owner_pid))
+}
+
+/// Open the tree with `options`, off the async threads: opening reads and may recover
+/// files.
+async fn open(options: &Options) -> surrealkv::Result<Tree> {
+    let options = options.clone();
+    tokio::task::spawn_blocking(move || TreeBuilder::with_options(options).build())
+        .await
+        .expect("opening the tree does not panic")
 }
 
 /// Whether opening failed because another process holds the database.

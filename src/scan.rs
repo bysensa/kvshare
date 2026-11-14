@@ -7,12 +7,13 @@
 
 use std::collections::VecDeque;
 
+use crate::api::Transaction;
+use crate::error::Result;
 use crate::protocol::{DEFAULT_PAGE, Entry, HistoryFilter, Version};
-use crate::shared::{Error, Tx};
 
 /// The entries of a key range, in key order or backwards.
-pub struct Scan<'t, 'a> {
-    tx: &'t mut Tx<'a>,
+pub struct Scan<'t> {
+    tx: &'t mut Transaction,
     /// What is left to read: `[start, end)`.
     start: Vec<u8>,
     end: Vec<u8>,
@@ -22,8 +23,8 @@ pub struct Scan<'t, 'a> {
     more: bool,
 }
 
-impl<'t, 'a> Scan<'t, 'a> {
-    pub(crate) fn new(tx: &'t mut Tx<'a>, start: &[u8], end: &[u8]) -> Self {
+impl<'t> Scan<'t> {
+    pub(crate) fn new(tx: &'t mut Transaction, start: &[u8], end: &[u8]) -> Self {
         Scan {
             tx,
             start: start.to_vec(),
@@ -48,7 +49,7 @@ impl<'t, 'a> Scan<'t, 'a> {
     }
 
     /// The next entry, fetching a page when the last one is used up.
-    pub async fn next(&mut self) -> Result<Option<Entry>, Error> {
+    pub async fn next(&mut self) -> Result<Option<Entry>> {
         if self.ready.is_empty() && self.more {
             let (entries, more) = self
                 .tx
@@ -73,8 +74,8 @@ impl<'t, 'a> Scan<'t, 'a> {
 }
 
 /// The versions of the keys of a range: keys in order, the versions of a key newest first.
-pub struct History<'t, 'a> {
-    tx: &'t mut Tx<'a>,
+pub struct History<'t> {
+    tx: &'t mut Transaction,
     /// What is left to read: `[start, end)`, past the first `skip` versions of `start`.
     start: Vec<u8>,
     end: Vec<u8>,
@@ -85,8 +86,8 @@ pub struct History<'t, 'a> {
     more: bool,
 }
 
-impl<'t, 'a> History<'t, 'a> {
-    pub(crate) fn new(tx: &'t mut Tx<'a>, start: &[u8], end: &[u8]) -> Self {
+impl<'t> History<'t> {
+    pub(crate) fn new(tx: &'t mut Transaction, start: &[u8], end: &[u8]) -> Self {
         History {
             tx,
             start: start.to_vec(),
@@ -119,7 +120,7 @@ impl<'t, 'a> History<'t, 'a> {
     }
 
     /// The next version, fetching a page when the last one is used up.
-    pub async fn next(&mut self) -> Result<Option<Version>, Error> {
+    pub async fn next(&mut self) -> Result<Option<Version>> {
         if self.ready.is_empty() && self.more {
             let (versions, more) = self
                 .tx

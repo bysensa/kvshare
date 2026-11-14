@@ -14,8 +14,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use kvshare::protocol::Durability;
-use kvshare::{Error, Options, Shared};
+use kvshare::{Durability, Error, Tree, TreeBuilder};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 #[tokio::main]
@@ -55,7 +54,7 @@ async fn write(
     durability: Durability,
     acks: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let shared = Shared::new(&db, Options::new(run_dir))?;
+    let tree = open(db, run_dir).await?;
     // One write per line and no buffer: a line that is written survives the death of
     // this process, as a commit in the page cache does.
     let mut acks = std::fs::OpenOptions::new()
@@ -66,8 +65,8 @@ async fn write(
         let key = format!("w{id}-{n:08}");
         loop {
             let attempt = async {
-                let mut tx = shared.begin(durability).await?;
-                tx.set(key.as_bytes(), key.as_bytes()).await?;
+                let mut tx = tree.begin().await?.with_durability(durability);
+                tx.set(key.as_bytes(), key.as_bytes())?;
                 tx.commit().await
             };
             match attempt.await {
@@ -78,7 +77,7 @@ async fn write(
                     | Error::NoOwner { .. }
                     | Error::OwnerSilent { .. }
                     | Error::Handshake(_)
-                    | Error::Conflict,
+                    | Error::TransactionWriteConflict,
                 ) => continue,
                 Err(other) => return Err(other.into()),
             }
@@ -90,8 +89,8 @@ async fn write(
 }
 
 async fn serve(db: PathBuf, run_dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-    let shared = Shared::new(&db, Options::new(run_dir))?;
-    let owner = shared.owner_pid().await?;
+    let tree = open(db, run_dir).await?;
+    let owner = tree.owner_pid().await?;
     if owner == std::process::id() {
         println!("owner");
     } else {
@@ -100,6 +99,17 @@ async fn serve(db: PathBuf, run_dir: PathBuf) -> Result<(), Box<dyn std::error::
     std::io::stdout().flush()?;
     std::future::pending::<()>().await;
     Ok(())
+}
+
+/// Open the database at `db` with versions kept, as every process of the tests does.
+/// Opening elects at once, so a database that is free on the way in is this process's.
+async fn open(db: PathBuf, run_dir: PathBuf) -> Result<Tree, Error> {
+    TreeBuilder::new()
+        .with_path(db)
+        .with_versioning(true, 0)
+        .with_run_dir(run_dir)
+        .build()
+        .await
 }
 
 /// Send back every 64-byte frame that arrives on `socket`: what the socket and the

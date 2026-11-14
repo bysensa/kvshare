@@ -2,21 +2,26 @@
 //!
 //! A message is a frame: its length as a little-endian `u32`, then the message in
 //! postcard. The owner's first frame is a [`Welcome`]: the version of the protocol, the
-//! canonical path of the database it owns, and its pid. A client of another version, or
-//! one that meant another database, refuses before its first request.
+//! canonical path of the database it owns, its pid, and the fingerprint of the options
+//! that every process must set alike. A client of another version, or one that meant
+//! another database or other options, refuses before its first request.
 //!
 //! Then the client sends `(id, Request)` frames and the owner answers `(id, Answer)`
 //! frames with the same id, in any order: requests of several tasks of one process
-//! share the connection. [`Request::Rollback`] has no answer.
+//! share the connection. [`Request::Begin`] and [`Request::Rollback`] have no answer.
 //!
-//! A transaction lives in the owner, in the table of the connection that began it:
-//! when the connection ends, every transaction it left open is rolled back.
+//! A transaction lives in the owner, in the table of the connection that began it, under
+//! a number the client chose: when the connection ends, every transaction it left open
+//! is rolled back. The owner handles a connection's requests in their order, so a
+//! transaction that a client begins without waiting is open, with its snapshot, before
+//! the client's next request reaches the owner.
 //!
 //! A client keeps the writes of its transaction until it needs the owner to have them:
-//! a commit, a range read and a history read carry them, and the owner applies them to
-//! the transaction in their order before anything else. A range or history read then
-//! is SurrealKV's own read of that transaction, which sees the transaction's writes.
-//! Such reads come in pages: each page is a new read of the same transaction.
+//! every read and the commit carry them, and the owner applies them to the transaction
+//! in their order, each by the SurrealKV method the client called, before the read or
+//! the commit. A read then is SurrealKV's own read of that transaction, which sees the
+//! transaction's writes. Range and history reads come in pages: each page is a new read
+//! of the same transaction.
 
 use std::io;
 use std::path::PathBuf;
@@ -25,8 +30,11 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
+use crate::error::KvError;
+use crate::types::{WireDurability, WireMode};
+
 /// The version of the protocol. Bump it when a message would mean something else.
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
 /// How many transactions one connection may hold open at once.
 pub const MAX_TRANSACTIONS: usize = 64;
@@ -42,7 +50,7 @@ pub const DEFAULT_PAGE: usize = 256;
 /// one entry if there is one, however large.
 pub const PAGE_BYTES: usize = 1 << 20;
 
-/// A transaction's number in the table of its connection.
+/// A transaction's number in the table of its connection, chosen by the client.
 pub type TxId = u64;
 
 /// A request's number on its connection; the answer carries it back.
@@ -51,58 +59,62 @@ pub type RequestId = u64;
 /// A key and its value, as a range read returns them.
 pub type Entry = (Vec<u8>, Vec<u8>);
 
-/// When a commit returns, as SurrealKV's `Durability`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Durability {
-    /// The commit is in the operating system's page cache: it survives the death of
-    /// the process, not a power cut.
-    Eventual,
-    /// The commit waits for a sync of the write-ahead log.
-    Immediate,
-}
-
-impl From<Durability> for surrealkv::Durability {
-    fn from(durability: Durability) -> Self {
-        match durability {
-            Durability::Eventual => surrealkv::Durability::Eventual,
-            Durability::Immediate => surrealkv::Durability::Immediate,
-        }
-    }
-}
-
 /// What the owner hands a connection when it begins.
 #[derive(Debug, Serialize, Deserialize)]
-pub struct Welcome {
-    pub version: u32,
+pub(crate) struct Welcome {
+    pub(crate) version: u32,
     /// The canonical path of the database the owner holds.
-    pub db: PathBuf,
-    pub owner_pid: u32,
+    pub(crate) db: PathBuf,
+    pub(crate) owner_pid: u32,
+    /// The fingerprint of the options every process must set alike.
+    pub(crate) fingerprint: [u8; 32],
 }
 
-/// A write a transaction makes; the client keeps them until the owner needs them.
+/// A write a transaction makes, one kind for each SurrealKV method, which the owner
+/// calls as the client did.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Write {
+pub(crate) enum Write {
     Set {
         key: Vec<u8>,
         value: Vec<u8>,
+    },
+    SetAt {
+        key: Vec<u8>,
+        value: Vec<u8>,
+        timestamp: u64,
+    },
+    /// `set_with_options`, with the one option a `WriteOptions` holds.
+    SetWithOptions {
+        key: Vec<u8>,
+        value: Vec<u8>,
+        timestamp: Option<u64>,
     },
     /// SurrealKV's `delete`: a hard delete, which takes the key's history with it.
     Delete {
         key: Vec<u8>,
     },
+    DeleteWithOptions {
+        key: Vec<u8>,
+        timestamp: Option<u64>,
+    },
     /// SurrealKV's `soft_delete`: a tombstone, after which the key's history stays.
     SoftDelete {
         key: Vec<u8>,
     },
-}
-
-impl Write {
-    /// The key the write is to.
-    pub fn key(&self) -> &[u8] {
-        match self {
-            Write::Set { key, .. } | Write::Delete { key } | Write::SoftDelete { key } => key,
-        }
-    }
+    SoftDeleteWithOptions {
+        key: Vec<u8>,
+        timestamp: Option<u64>,
+    },
+    Replace {
+        key: Vec<u8>,
+        value: Vec<u8>,
+    },
+    DeleteRange {
+        start: Vec<u8>,
+        end: Vec<u8>,
+    },
+    SetSavepoint,
+    RollbackToSavepoint,
 }
 
 /// Which versions a history read returns besides the values: tombstones or not, and only
@@ -124,29 +136,54 @@ pub struct Version {
     pub value: Option<Vec<u8>>,
 }
 
-/// What a client asks the owner.
+/// What a client asks the owner. Every request on a transaction carries the writes the
+/// client made since its last request, which the owner applies first.
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Request {
-    /// The value of `key` in transaction `tx`; with `tx: None`, in a transaction that
-    /// begins now, whose number the answer carries.
-    Get { tx: Option<TxId>, key: Vec<u8> },
-    /// The value of `key` as of `timestamp` (nanoseconds), in a read of its own.
-    GetAt { key: Vec<u8>, timestamp: u64 },
-    /// Apply `writes` to transaction `tx` (or one that begins now), then read up to
-    /// `limit` entries of `[start, end)` in key order, or in reverse.
+pub(crate) enum Request {
+    /// Begin transaction `tx`. It has no answer: a failure comes back on the next request
+    /// on `tx`.
+    Begin {
+        tx: TxId,
+        mode: WireMode,
+        durability: WireDurability,
+    },
+    /// `get`, or `get_for_update`.
+    Get {
+        tx: TxId,
+        writes: Vec<Write>,
+        key: Vec<u8>,
+        for_update: bool,
+    },
+    GetMany {
+        tx: TxId,
+        writes: Vec<Write>,
+        keys: Vec<Vec<u8>>,
+    },
+    GetAt {
+        tx: TxId,
+        writes: Vec<Write>,
+        key: Vec<u8>,
+        timestamp: u64,
+    },
+    GetManyAt {
+        tx: TxId,
+        writes: Vec<Write>,
+        keys: Vec<Vec<u8>>,
+        timestamp: u64,
+    },
+    /// Up to `limit` entries of `[start, end)` in key order, or in reverse.
     Range {
-        tx: Option<TxId>,
+        tx: TxId,
         writes: Vec<Write>,
         start: Vec<u8>,
         end: Vec<u8>,
         reverse: bool,
         limit: u32,
     },
-    /// Apply `writes` to transaction `tx` (or one that begins now), then read up to
-    /// `limit` versions of the keys of `[start, end)` that pass `filter`, past the first
-    /// `skip` versions of `start`.
+    /// Up to `limit` versions of the keys of `[start, end)` that pass `filter`, past the
+    /// first `skip` versions of `start`.
     History {
-        tx: Option<TxId>,
+        tx: TxId,
         writes: Vec<Write>,
         start: Vec<u8>,
         end: Vec<u8>,
@@ -154,12 +191,12 @@ pub enum Request {
         filter: HistoryFilter,
         limit: u32,
     },
-    /// Apply `writes` to transaction `tx` and commit it; with `tx: None`, in a
-    /// transaction that begins now. The transaction ends whatever the answer.
+    /// Commit transaction `tx`, whose commit returns as `durability` says. The
+    /// transaction ends whatever the answer.
     Commit {
-        tx: Option<TxId>,
-        durability: Durability,
+        tx: TxId,
         writes: Vec<Write>,
+        durability: WireDurability,
     },
     /// Roll transaction `tx` back. It has no answer.
     Rollback { tx: TxId },
@@ -167,21 +204,16 @@ pub enum Request {
 
 /// What the owner answers a request.
 #[derive(Debug, Serialize, Deserialize)]
-pub enum Answer {
-    Got {
-        tx: TxId,
-        value: Option<Vec<u8>>,
-    },
-    GotAt(Option<Vec<u8>>),
+pub(crate) enum Answer {
+    Got(Option<Vec<u8>>),
+    GotMany(Vec<Option<Vec<u8>>>),
     /// A page of a range read, and whether more follow.
     Ranged {
-        tx: TxId,
         entries: Vec<Entry>,
         more: bool,
     },
     /// A page of a history read, and whether more follow.
     Versions {
-        tx: TxId,
         versions: Vec<Version>,
         more: bool,
     },
@@ -189,30 +221,8 @@ pub enum Answer {
     Failed(KvError),
 }
 
-/// Why the owner refused a request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum KvError {
-    /// Another transaction committed a write to a key this one wrote.
-    Conflict,
-    /// The connection holds no transaction with this number.
-    NoSuchTransaction(TxId),
-    /// The connection already holds [`MAX_TRANSACTIONS`] open transactions.
-    TooManyTransactions,
-    /// SurrealKV refused the operation.
-    Engine(String),
-}
-
-impl From<surrealkv::Error> for KvError {
-    fn from(error: surrealkv::Error) -> Self {
-        match error {
-            surrealkv::Error::TransactionWriteConflict => KvError::Conflict,
-            other => KvError::Engine(other.to_string()),
-        }
-    }
-}
-
 /// Write `message` as one frame, in one write.
-pub async fn write_frame<W, T>(writer: &mut W, message: &T) -> io::Result<()>
+pub(crate) async fn write_frame<W, T>(writer: &mut W, message: &T) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
     T: Serialize,
@@ -227,7 +237,7 @@ where
 }
 
 /// Read one frame and decode its message.
-pub async fn read_frame<R, T>(reader: &mut R) -> io::Result<T>
+pub(crate) async fn read_frame<R, T>(reader: &mut R) -> io::Result<T>
 where
     R: AsyncRead + Unpin,
     T: DeserializeOwned,
@@ -253,16 +263,18 @@ mod tests {
     #[tokio::test]
     async fn a_frame_carries_its_message_and_a_huge_one_is_refused() {
         let request = Request::Commit {
-            tx: Some(7),
-            durability: Durability::Immediate,
+            tx: 7,
+            durability: WireDurability::Immediate,
             writes: vec![
                 Write::Set {
                     key: b"k".to_vec(),
                     value: vec![0; 300],
                 },
-                Write::Delete {
-                    key: b"gone".to_vec(),
+                Write::DeleteRange {
+                    start: b"a".to_vec(),
+                    end: b"b".to_vec(),
                 },
+                Write::SetSavepoint,
             ],
         };
         let mut wire = Vec::new();

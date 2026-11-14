@@ -9,7 +9,6 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use kvshare::{Options, Shared};
 use surrealkv::{Mode, TreeBuilder};
 use tokio::process::{Child, Command};
 
@@ -43,8 +42,11 @@ async fn kill_owners_while_writing(durability: &str) {
 
     // Kill whichever writer owns the database, start another writer in its place, and
     // wait until another process answers as the owner. The probe only asks the owner
-    // over its socket: it never opens the database.
-    let probe = Shared::new(&db, Options::new(&run_dir)).expect("the probe");
+    // over its socket: it never opens the database. Its options are the writers'.
+    let probe = kvshare::TreeBuilder::new()
+        .with_path(db.clone())
+        .with_versioning(true, 0)
+        .with_run_dir(run_dir.clone());
     let mut kills: Vec<u128> = Vec::new();
     let started = Instant::now();
     while started.elapsed() < KILLING_FOR {

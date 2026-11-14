@@ -7,32 +7,42 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use surrealkv::{Mode, Transaction, Tree};
+use surrealkv::{Transaction, Tree};
 use tokio::io::BufReader;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::endpoint::Endpoint;
+use crate::error::KvError;
 use crate::exec::{apply, history_page, range_page};
 use crate::protocol::{
-    Answer, Durability, HistoryFilter, KvError, MAX_TRANSACTIONS, Request, RequestId, TxId,
-    VERSION, Welcome, Write, read_frame, write_frame,
+    Answer, MAX_TRANSACTIONS, Request, RequestId, TxId, VERSION, Welcome, Write, read_frame,
+    write_frame,
 };
+use crate::types::{WireDurability, WireMode};
 
 /// This process owns the database: it holds the tree and serves it on the socket.
-pub struct Owner {
+///
+/// The tree is shared in an `Arc` and never cloned: dropping any clone of a native
+/// SurrealKV `Tree` closes the database.
+pub(crate) struct Owner {
     tree: Arc<Tree>,
     socket: PathBuf,
     accept: JoinHandle<()>,
 }
 
 impl Owner {
-    /// Serve `tree`, which this process has just opened, on the socket of `endpoint`.
+    /// Serve `tree`, which this process has just opened, on the socket of `endpoint`,
+    /// telling each client the `fingerprint` of the options it opened the tree with.
     ///
     /// Only the holder of the database's lock calls this, so a socket file found at
     /// the path was left by an owner that is gone, and it is removed without asking.
     /// Must be called on a Tokio runtime.
-    pub fn start(tree: Tree, endpoint: &Endpoint) -> io::Result<Owner> {
+    pub(crate) fn start(
+        tree: Tree,
+        endpoint: &Endpoint,
+        fingerprint: [u8; 32],
+    ) -> io::Result<Owner> {
         if let Some(dir) = endpoint.socket.parent() {
             std::fs::create_dir_all(dir)?;
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
@@ -43,8 +53,14 @@ impl Owner {
             Err(error) => return Err(error),
         }
         let listener = UnixListener::bind(&endpoint.socket)?;
+        let welcome = Arc::new(Welcome {
+            version: VERSION,
+            db: endpoint.db.clone(),
+            owner_pid: std::process::id(),
+            fingerprint,
+        });
         let tree = Arc::new(tree);
-        let accept = tokio::spawn(accept(listener, Arc::clone(&tree), endpoint.db.clone()));
+        let accept = tokio::spawn(accept(listener, Arc::clone(&tree), welcome));
         Ok(Owner {
             tree,
             socket: endpoint.socket.clone(),
@@ -53,7 +69,7 @@ impl Owner {
     }
 
     /// The tree, for this process's own transactions.
-    pub fn tree(&self) -> &Arc<Tree> {
+    pub(crate) fn tree(&self) -> &Arc<Tree> {
         &self.tree
     }
 
@@ -61,7 +77,7 @@ impl Owner {
     ///
     /// The clients lose their connections, their open transactions are rolled back,
     /// and they elect the next owner once the lock is released.
-    pub async fn close(self) -> Result<(), surrealkv::Error> {
+    pub(crate) async fn close(self) -> Result<(), surrealkv::Error> {
         // Aborting the accept task drops its set of connections, which aborts them.
         self.accept.abort();
         let _ = self.accept.await;
@@ -72,12 +88,12 @@ impl Owner {
 
 /// Take connections until the task is aborted; each connection is served by a task
 /// of its own, which the set aborts when it is dropped.
-async fn accept(listener: UnixListener, tree: Arc<Tree>, db: PathBuf) {
+async fn accept(listener: UnixListener, tree: Arc<Tree>, welcome: Arc<Welcome>) {
     let mut connections = JoinSet::new();
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
-                connections.spawn(serve(stream, Arc::clone(&tree), db.clone()));
+                connections.spawn(serve(stream, Arc::clone(&tree), Arc::clone(&welcome)));
             }
             // Out of descriptors, or a connection reset before it was taken: wait a
             // little rather than spin on an error that repeats.
@@ -89,19 +105,15 @@ async fn accept(listener: UnixListener, tree: Arc<Tree>, db: PathBuf) {
 
 /// Welcome the client of `stream`, then answer its requests until it goes away.
 ///
-/// Reads and rollbacks are answered in turn. A commit runs in a task of its own, so a
+/// Requests are handled in their order, so a transaction a client begins without
+/// waiting is open before its next request. A commit runs in a task of its own, so a
 /// commit that waits for a sync does not hold up the client's other requests. When the
 /// client goes away, its table is dropped, which rolls back what it left open, and the
 /// commits already started run to their end.
-async fn serve(stream: UnixStream, tree: Arc<Tree>, db: PathBuf) {
+async fn serve(stream: UnixStream, tree: Arc<Tree>, welcome: Arc<Welcome>) {
     let (read, write) = stream.into_split();
     let writer = Arc::new(tokio::sync::Mutex::new(write));
-    let welcome = Welcome {
-        version: VERSION,
-        db,
-        owner_pid: std::process::id(),
-    };
-    if write_frame(&mut *writer.lock().await, &welcome)
+    if write_frame(&mut *writer.lock().await, &*welcome)
         .await
         .is_err()
     {
@@ -111,14 +123,57 @@ async fn serve(stream: UnixStream, tree: Arc<Tree>, db: PathBuf) {
     let mut reader = BufReader::new(read);
     let mut table = Table {
         tree,
-        next: 1,
         open: HashMap::new(),
     };
     let mut commits = JoinSet::new();
     while let Ok((id, request)) = read_frame::<_, (RequestId, Request)>(&mut reader).await {
         let answer = match request {
-            Request::Get { tx, key } => table.get(tx, key),
-            Request::GetAt { key, timestamp } => table.get_at(key, timestamp),
+            Request::Begin {
+                tx,
+                mode,
+                durability,
+            } => {
+                table.begin(tx, mode, durability);
+                continue;
+            }
+            Request::Rollback { tx } => {
+                if let Some(Slot::Open(mut transaction)) = table.open.remove(&tx) {
+                    transaction.rollback();
+                }
+                continue;
+            }
+            Request::Get {
+                tx,
+                writes,
+                key,
+                for_update,
+            } => table.on(tx, writes, |transaction| {
+                let value = if for_update {
+                    transaction.get_for_update(key)?
+                } else {
+                    transaction.get(key)?
+                };
+                Ok(Answer::Got(value))
+            }),
+            Request::GetMany { tx, writes, keys } => table.on(tx, writes, |transaction| {
+                Ok(Answer::GotMany(transaction.get_many(&keys)?))
+            }),
+            Request::GetAt {
+                tx,
+                writes,
+                key,
+                timestamp,
+            } => table.on(tx, writes, |transaction| {
+                Ok(Answer::Got(transaction.get_at(key, timestamp)?))
+            }),
+            Request::GetManyAt {
+                tx,
+                writes,
+                keys,
+                timestamp,
+            } => table.on(tx, writes, |transaction| {
+                Ok(Answer::GotMany(transaction.get_many_at(&keys, timestamp)?))
+            }),
             Request::Range {
                 tx,
                 writes,
@@ -126,7 +181,11 @@ async fn serve(stream: UnixStream, tree: Arc<Tree>, db: PathBuf) {
                 end,
                 reverse,
                 limit,
-            } => table.range(tx, writes, &start, &end, reverse, limit as usize),
+            } => table.on(tx, writes, |transaction| {
+                let (entries, more) =
+                    range_page(transaction, &start, &end, reverse, limit as usize)?;
+                Ok(Answer::Ranged { entries, more })
+            }),
             Request::History {
                 tx,
                 writes,
@@ -135,18 +194,16 @@ async fn serve(stream: UnixStream, tree: Arc<Tree>, db: PathBuf) {
                 skip,
                 filter,
                 limit,
-            } => table.history(tx, writes, &start, &end, skip, filter, limit as usize),
-            Request::Rollback { tx } => {
-                if let Some(mut transaction) = table.open.remove(&tx) {
-                    transaction.rollback();
-                }
-                continue;
-            }
+            } => table.on(tx, writes, |transaction| {
+                let (versions, more) =
+                    history_page(transaction, &start, &end, skip, filter, limit as usize)?;
+                Ok(Answer::Versions { versions, more })
+            }),
             Request::Commit {
                 tx,
-                durability,
                 writes,
-            } => match table.prepare(tx, durability, writes) {
+                durability,
+            } => match table.prepare(tx, writes, durability) {
                 Ok(mut transaction) => {
                     let writer = Arc::clone(&writer);
                     commits.spawn(async move {
@@ -175,108 +232,70 @@ async fn serve(stream: UnixStream, tree: Arc<Tree>, db: PathBuf) {
     while commits.join_next().await.is_some() {}
 }
 
+/// A transaction of a client, or why it could not begin: the reason comes back on the
+/// client's next request on it.
+enum Slot {
+    Open(Transaction),
+    Failed(KvError),
+}
+
 /// The transactions one client holds open.
 struct Table {
     tree: Arc<Tree>,
-    next: TxId,
-    open: HashMap<TxId, Transaction>,
+    open: HashMap<TxId, Slot>,
 }
 
 impl Table {
-    /// Transaction `tx`, or one that begins now, with `writes` applied to it in their
-    /// order: the transaction a read of a client works on.
-    fn open(
-        &mut self,
-        tx: Option<TxId>,
-        writes: Vec<Write>,
-    ) -> Result<(TxId, &mut Transaction), KvError> {
-        let tx = match tx {
-            Some(tx) => tx,
-            None => {
-                if self.open.len() >= MAX_TRANSACTIONS {
-                    return Err(KvError::TooManyTransactions);
+    /// Begin transaction `tx` as SurrealKV begins one with `mode`, its commit returning
+    /// as `durability` says; or keep why it could not begin.
+    fn begin(&mut self, tx: TxId, mode: WireMode, durability: WireDurability) {
+        let slot = if self.open.len() >= MAX_TRANSACTIONS {
+            Slot::Failed(KvError::TooManyTransactions)
+        } else {
+            match self.tree.begin_with_mode(mode.mode()) {
+                Ok(mut transaction) => {
+                    transaction.set_durability(durability.durability());
+                    Slot::Open(transaction)
                 }
-                let tx = self.next;
-                self.next += 1;
-                self.open.insert(tx, self.tree.begin()?);
-                tx
+                Err(error) => Slot::Failed(error.into()),
             }
         };
-        let transaction = self
-            .open
-            .get_mut(&tx)
-            .ok_or(KvError::NoSuchTransaction(tx))?;
-        apply(transaction, writes)?;
-        Ok((tx, transaction))
+        self.open.insert(tx, slot);
     }
 
-    /// The value of `key` in transaction `tx`, or in a transaction that begins now.
-    fn get(&mut self, tx: Option<TxId>, key: Vec<u8>) -> Result<Answer, KvError> {
-        let (tx, transaction) = self.open(tx, Vec::new())?;
-        Ok(Answer::Got {
-            tx,
-            value: transaction.get(key)?,
-        })
-    }
-
-    /// A page of a range read of transaction `tx`, after its `writes`.
-    fn range(
+    /// Apply `writes` to transaction `tx`, then answer with `read` on it.
+    fn on(
         &mut self,
-        tx: Option<TxId>,
+        tx: TxId,
         writes: Vec<Write>,
-        start: &[u8],
-        end: &[u8],
-        reverse: bool,
-        limit: usize,
+        read: impl FnOnce(&mut Transaction) -> surrealkv::Result<Answer>,
     ) -> Result<Answer, KvError> {
-        let (tx, transaction) = self.open(tx, writes)?;
-        let (entries, more) = range_page(transaction, start, end, reverse, limit)?;
-        Ok(Answer::Ranged { tx, entries, more })
+        match self.open.get_mut(&tx) {
+            Some(Slot::Open(transaction)) => {
+                apply(transaction, writes)?;
+                Ok(read(transaction)?)
+            }
+            Some(Slot::Failed(error)) => Err(error.clone()),
+            None => Err(KvError::NoSuchTransaction(tx)),
+        }
     }
 
-    /// A page of a history read of transaction `tx`, after its `writes`.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the fields of one request, passed as they came"
-    )]
-    fn history(
-        &mut self,
-        tx: Option<TxId>,
-        writes: Vec<Write>,
-        start: &[u8],
-        end: &[u8],
-        skip: u64,
-        filter: HistoryFilter,
-        limit: usize,
-    ) -> Result<Answer, KvError> {
-        let (tx, transaction) = self.open(tx, writes)?;
-        let (versions, more) = history_page(transaction, start, end, skip, filter, limit)?;
-        Ok(Answer::Versions { tx, versions, more })
-    }
-
-    /// The value of `key` as of `timestamp`, in a read of its own.
-    fn get_at(&self, key: Vec<u8>, timestamp: u64) -> Result<Answer, KvError> {
-        let transaction = self.tree.begin_with_mode(Mode::ReadOnly)?;
-        Ok(Answer::GotAt(transaction.get_at(key, timestamp)?))
-    }
-
-    /// Take transaction `tx` out of the table, or begin one, and apply `writes` to it:
-    /// what is left of it is the commit.
+    /// Take transaction `tx` out of the table and apply `writes` to it: what is left of
+    /// it is the commit, which returns as `durability` says.
     fn prepare(
         &mut self,
-        tx: Option<TxId>,
-        durability: Durability,
+        tx: TxId,
         writes: Vec<Write>,
+        durability: WireDurability,
     ) -> Result<Transaction, KvError> {
-        let mut transaction = match tx {
-            Some(tx) => self
-                .open
-                .remove(&tx)
-                .ok_or(KvError::NoSuchTransaction(tx))?,
-            None => self.tree.begin()?,
-        };
-        transaction.set_durability(durability.into());
-        apply(&mut transaction, writes)?;
-        Ok(transaction)
+        match self.open.remove(&tx) {
+            Some(Slot::Open(mut transaction)) => {
+                transaction.set_durability(durability.durability());
+                apply(&mut transaction, writes)?;
+                Ok(transaction)
+            }
+            Some(Slot::Failed(error)) => Err(error),
+            None => Err(KvError::NoSuchTransaction(tx)),
+        }
     }
 }
