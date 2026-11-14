@@ -156,10 +156,19 @@ kvshare's own:
 **A commit that ends in `OwnerLost` or `OwnerSilent` may have happened or not.** The
 owner may have committed it just before it died or while it did not answer, and a
 commit that reached a live owner stands even if its client never hears of it. kvshare
-has no way yet to ask what became of a commit. A caller that must know writes so that
-the transaction can be repeated safely (the same keys and values again), or reads the
-keys back in a new transaction before it decides; `tests/failover.rs` repeats its
-writes that way.
+has no way yet to ask what became of a commit, but a new transaction tells:
+
+- after `OwnerSilent`, the owner begins the next transaction of the same tree only once
+  the commit is done, so the transaction sees it if it landed, whenever the owner
+  answers again;
+- after `OwnerLost`, the next transaction runs on the next owner, which opens the
+  database only once the old one died or let it go. Only an owner that lost the
+  connection and lives on may still be finishing a commit of the old connection.
+
+A caller that must know reads the keys back in a new transaction before it decides
+(a read that is `OwnerSilent` itself is asked again), or writes so that the transaction
+can be repeated safely (the same keys and values again); `tests/failover.rs` repeats
+its writes that way.
 
 ## Where kvshare differs from SurrealKV
 
@@ -253,8 +262,9 @@ cargo test
   cursor over keys only; a cursor moved in a spawned task.
 - `tests/processes.rs`: an owner stopped with SIGSTOP, whose client gets `OwnerSilent`
   and works on over the same connection once SIGCONT resumes it, a request bigger than
-  the socket's buffer arriving whole; clients killed with SIGKILL while their
-  transactions are open.
+  the socket's buffer arriving whole; a commit the owner was silent about, which the
+  client's next transaction sees; clients killed with SIGKILL while their transactions
+  are open.
 - `tests/failover.rs`: writers in several processes while the owner is killed again
   and again; `KVSHARE_FAILOVER_SECONDS` makes it run longer than 6 seconds.
 - Unit tests: frames, endpoints, a write stall across the socket, and a client that

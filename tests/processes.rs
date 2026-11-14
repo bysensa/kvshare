@@ -1,5 +1,5 @@
 //! What other processes do to a database: an owner that stops answering and resumes,
-//! and clients killed in the middle of their transactions.
+//! a commit it was silent about, and clients killed in the middle of their transactions.
 
 mod common;
 
@@ -8,7 +8,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use common::{base, builder};
-use kvshare::{Error, TreeBuilder};
+use kvshare::{Durability, Error, TreeBuilder};
 use tokio::io::{AsyncBufReadExt as _, BufReader};
 use tokio::process::{Child, Command};
 
@@ -94,6 +94,78 @@ async fn a_stopped_owner_is_silent_and_works_on_once_resumed() {
         .expect("the silent transaction works on");
     assert_eq!(carried.map(|value| value.len()), Some(big.len()));
     drop((silent, after));
+
+    client.close().await.expect("the client closes");
+    owner.start_kill().expect("SIGKILL to the owner");
+    owner.wait().await.expect("the owner exits");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A commit that came back `OwnerSilent` lands once the owner resumes, and a
+/// transaction the client begins after it sees it: the owner takes a snapshot only after
+/// the commits sent before it on the same connection are done. So a client unsure of a
+/// commit learns its outcome by reading, and never finds it absent first and there
+/// later, which would make it apply the commit a second time.
+///
+/// The commit syncs its log, so it takes longer than reading the requests behind it,
+/// which the owner finds waiting in its socket when it resumes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_transaction_after_a_silent_commit_sees_it() {
+    const ROUNDS: usize = 8;
+    let base = base("silentcommit");
+    let (db, run) = (base.join("db"), base.join("run"));
+    let (mut owner, said) = worker(&["serve", path(&db), path(&run)]).await;
+    assert_eq!(said, "owner", "the worker owns the database");
+    let pid = owner.id().expect("a running owner");
+    let client = TreeBuilder::new()
+        .with_path(db.clone())
+        .with_versioning(true, 0)
+        .with_run_dir(run.clone())
+        .with_call_timeout(Duration::from_millis(300))
+        .build()
+        .await
+        .expect("the client");
+
+    for round in 0..ROUNDS {
+        let key = format!("silent-{round}");
+        signal("STOP", pid).await;
+        let mut silent = client
+            .begin()
+            .await
+            .expect("begin asks nothing")
+            .with_durability(Durability::Immediate);
+        silent.set(key.as_bytes(), b"landed").expect("a write");
+        match silent.commit().await {
+            Err(Error::OwnerSilent { .. }) => {}
+            other => panic!("round {round}: a stopped owner should be silent, got {other:?}"),
+        }
+        // Read the key back as a client unsure of the commit does: the requests wait in
+        // the owner's socket behind the commit until it resumes.
+        let check = client.begin().await.expect("begin asks nothing");
+        let resume = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            signal("CONT", pid).await;
+        };
+        let (seen, ()) = tokio::join!(check.get(key.as_bytes()), resume);
+        let seen = seen.expect("the owner answers once resumed");
+        let later = client
+            .begin()
+            .await
+            .expect("a transaction")
+            .get(key.as_bytes())
+            .await
+            .expect("a read");
+        assert_eq!(
+            later.as_deref(),
+            Some(&b"landed"[..]),
+            "round {round}: the commit landed"
+        );
+        assert_eq!(
+            seen.as_deref(),
+            Some(&b"landed"[..]),
+            "round {round}: a transaction begun after the silent commit missed it"
+        );
+    }
 
     client.close().await.expect("the client closes");
     owner.start_kill().expect("SIGKILL to the owner");

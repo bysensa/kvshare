@@ -117,7 +117,10 @@ async fn accept(listener: UnixListener, tree: Arc<Tree>, welcome: Arc<Welcome>) 
 /// Requests are handled in their order, so a transaction a client begins without
 /// waiting is open before its next request. A commit, and an operation on the whole
 /// database, runs in a task of its own, so one that waits for a sync or copies files does
-/// not hold up the client's other requests. When the client goes away, its table is
+/// not hold up the client's other requests. A transaction begins only once the commits
+/// the client sent before it are done, so that its snapshot holds them: a client that
+/// stopped waiting for a commit (`OwnerSilent`) learns by reading whether it landed, and
+/// does not find it absent and then present. When the client goes away, its table is
 /// dropped, which rolls back what it left open, and the work already started runs to its
 /// end.
 async fn serve(stream: UnixStream, tree: Arc<Tree>, welcome: Arc<Welcome>) {
@@ -135,7 +138,10 @@ async fn serve(stream: UnixStream, tree: Arc<Tree>, welcome: Arc<Welcome>) {
         tree,
         open: HashMap::new(),
     };
+    // The operations on the whole database under way, and apart from them the commits,
+    // which every begin waits for.
     let mut running = JoinSet::new();
+    let mut commits = JoinSet::new();
     while let Ok((id, request)) = read_frame::<_, (RequestId, Request)>(&mut reader).await {
         let answer = match request {
             Request::Begin {
@@ -143,6 +149,7 @@ async fn serve(stream: UnixStream, tree: Arc<Tree>, welcome: Arc<Welcome>) {
                 mode,
                 durability,
             } => {
+                while commits.join_next().await.is_some() {}
                 table.begin(tx, mode, durability);
                 continue;
             }
@@ -203,7 +210,7 @@ async fn serve(stream: UnixStream, tree: Arc<Tree>, welcome: Arc<Welcome>) {
             } => match table.prepare(tx, writes, durability) {
                 Ok(mut transaction) => {
                     let writer = Arc::clone(&writer);
-                    running.spawn(async move {
+                    commits.spawn(async move {
                         let answer = match transaction.commit().await {
                             Ok(()) => Answer::Committed,
                             Err(error) => Answer::Failed(error.into()),
@@ -235,9 +242,11 @@ async fn serve(stream: UnixStream, tree: Arc<Tree>, welcome: Arc<Welcome>) {
             break;
         }
         while running.try_join_next().is_some() {}
+        while commits.try_join_next().is_some() {}
     }
     drop(table);
     while running.join_next().await.is_some() {}
+    while commits.join_next().await.is_some() {}
 }
 
 /// A transaction of a client, or why it could not begin: the reason comes back on the

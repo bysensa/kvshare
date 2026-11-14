@@ -350,7 +350,8 @@ impl Tree {
 
     /// Begin a transaction in `mode`. Its snapshot is taken now, as in SurrealKV: a
     /// client tells the owner without waiting for an answer, and the owner opens the
-    /// transaction before it reads the client's next request.
+    /// transaction before it reads the client's next request, once the commits the
+    /// client sent before it are done, those it stopped waiting for too.
     pub async fn begin_with_mode(&self, mode: Mode) -> Result<Transaction> {
         let wire_mode = WireMode::of(mode)?;
         let (generation, state) = match self.inner.route().await? {
