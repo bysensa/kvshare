@@ -8,7 +8,7 @@
 mod common;
 
 use common::{base, builder, close, owner_and_client};
-use kvshare::{Error, Mode, ReadOptions, WriteOptions};
+use kvshare::{Durability, Error, Mode, ReadOptions, WriteOptions};
 use surrealkv::{HistoryOptions, LSMIterator};
 
 /// A database under test.
@@ -187,6 +187,28 @@ impl Tx {
 
     async fn get(&mut self, key: &[u8]) -> String {
         read!(self, get(key))
+    }
+
+    async fn get_async(&mut self, key: &[u8]) -> String {
+        match self {
+            Tx::Plain(t) => said(plain(t.get_async(key).await)),
+            Tx::Shared(t) => said(t.get_async(key).await),
+        }
+    }
+
+    fn set_durability(&mut self, durability: Durability) {
+        match self {
+            Tx::Plain(t) => t.set_durability(durability),
+            Tx::Shared(t) => t.set_durability(durability),
+        }
+    }
+
+    /// `with_durability`, which takes the transaction and gives it back.
+    fn with_durability(self, durability: Durability) -> Self {
+        match self {
+            Tx::Plain(t) => Tx::Plain(t.with_durability(durability)),
+            Tx::Shared(t) => Tx::Shared(t.with_durability(durability)),
+        }
     }
 
     async fn get_for_update(&mut self, key: &[u8]) -> String {
@@ -493,9 +515,16 @@ async fn writes(db: &Db<'_>) -> Vec<String> {
         log.push(tx.set_at(b"a", value, at));
         log.push(tx.commit().await);
     }
-    let mut tx = db.begin(Mode::ReadWrite).await;
+    // Durability changes when a commit returns, not what it writes.
+    let mut tx = db
+        .begin(Mode::ReadWrite)
+        .await
+        .with_durability(Durability::Immediate);
     log.push(tx.set_with_options(b"b", b"b300", Some(300)));
     log.push(tx.set_with_options(b"c", b"c-now", None));
+    log.push(tx.commit().await);
+    let mut tx = db.begin(Mode::ReadWrite).await;
+    tx.set_durability(Durability::Immediate);
     log.push(tx.set(b"d", b"d-now"));
     log.push(tx.set(b"e", b"e-now"));
     log.push(tx.commit().await);
@@ -571,6 +600,7 @@ async fn reads(db: &Db<'_>) -> Vec<String> {
 
     let mut tx = db.begin(Mode::ReadWrite).await;
     log.push(format!("many: {}", tx.get_many(&[b"a", b"x", b"c"]).await));
+    log.push(format!("async: {}", tx.get_async(b"c").await));
     log.push(format!("with: {}", tx.get_with(b"c").await));
     log.push(format!("with, missing: {}", tx.get_with(b"x").await));
     log.push(format!(
