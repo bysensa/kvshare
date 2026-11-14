@@ -2,11 +2,10 @@
 //! again, replacing the facts the file held with the facts it holds now. Facts are kept
 //! by the hash of their content and shared by the files that hold them, with a count of
 //! references; a fact no file refers to any more goes. One transaction changes the
-//! file's facts, the counts and the facts together. A fifth of the facts are large
-//! enough for the value log, which takes values over 1 KiB; they are kept under 8 KiB,
-//! as the database keeps every version for ever and a large fact a file no longer holds
-//! stays in its history. After each commit the indexer finds every fact of the file
-//! again with a cursor over keys only.
+//! file's facts, the counts and the facts together. A fifth of the facts are large, of 2
+//! to 8 KiB, and one in a hundred very large, of 64 to 192 KiB, for the value log. After
+//! each commit the indexer finds every fact of the file again with a cursor over keys
+//! only.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -42,7 +41,9 @@ pub async fn run(run: PathBuf, seed: u64) -> Result<(), String> {
                 let shared = ctx.rng.below(SHARED);
                 format!("shared fact {shared}").into_bytes()
             } else {
-                let size = if ctx.rng.chance(20) {
+                let size = if ctx.rng.chance(1) {
+                    ctx.rng.between(64 << 10, 192 << 10)
+                } else if ctx.rng.chance(20) {
                     ctx.rng.between(2 << 10, 8 << 10)
                 } else {
                     ctx.rng.between(64, 512)

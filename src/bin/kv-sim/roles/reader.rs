@@ -1,17 +1,17 @@
 //! A reader, as the desktop client and the web UI read: it follows the tails of thread
-//! journals, lists threads, sums the metrics and reads tasks' histories. Each read is one
-//! read-only transaction, so it sees one snapshot, and in it the reader checks what must
-//! hold in any snapshot:
+//! journals, lists threads, sums the metrics and reads tasks with their transitions.
+//! Each read is one read-only transaction, so it sees one snapshot, and in it the reader
+//! checks what must hold in any snapshot:
 //! - the metrics' records sum to the total;
 //! - a thread's journal runs from 1 to its head without a gap, under epochs that never
 //!   go back, each epoch written by one process;
-//! - a task's versions are the steps its transitions took.
+//! - a task's record is where its transitions took it, and they run from 1 without a gap.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use kvshare::{HistoryOptions, Mode, Transaction};
+use kvshare::{Mode, Transaction};
 
 use super::hook::TASKS;
 use super::{Class, Ctx, class, counted, stopping};
@@ -145,35 +145,35 @@ async fn thread(
     Ok(())
 }
 
-/// A task's versions, newest first, are its transitions' steps, last first.
+/// A task is where its transitions took it: its record holds the status of the last
+/// and how many there are, and they are numbered from 1 without a gap.
 async fn task(tx: &Transaction, ctx: &mut Ctx) -> kvshare::Result<()> {
     let id = ctx.rng.below(TASKS);
-    let key = keys::task(id);
-    let mut past = key.clone();
-    past.push(0);
-    let mut versions = Vec::new();
-    let options = HistoryOptions::new().with_limit(10_000);
-    let mut cursor = tx.history_with_options(key.as_slice(), past.as_slice(), &options)?;
-    let mut valid = cursor.seek_first().await?;
-    while valid {
-        let task: Task = keys::decode(&cursor.value()?).map_err(kvshare::Error::Engine)?;
-        versions.push(task.status);
-        valid = cursor.next().await?;
-    }
-    drop(cursor);
+    let held = match tx.get(keys::task(id)).await? {
+        Some(bytes) => {
+            let task: Task = keys::decode(&bytes).map_err(kvshare::Error::Engine)?;
+            Some((task.status, task.n))
+        }
+        None => None,
+    };
     let (start, end) = keys::transitions(id);
     let mut steps = Vec::new();
     let mut cursor = tx.range(start, end)?;
     let mut valid = cursor.seek_first().await?;
     while valid {
+        let n = keys::number_of(cursor.key().user_key()).unwrap_or(0);
         let step: Transition = keys::decode(&cursor.value()?).map_err(kvshare::Error::Engine)?;
-        steps.push(step.to);
+        steps.push((n, step.to));
         valid = cursor.next().await?;
     }
-    steps.reverse();
-    if versions != steps {
+    let numbered = steps
+        .iter()
+        .enumerate()
+        .all(|(at, (n, _))| *n == at as u64 + 1);
+    let went = steps.last().map(|(_, to)| (*to, steps.len() as u64));
+    if !numbered || held != went {
         ctx.journal.violation(&format!(
-            "task {id}: its versions are {versions:?} but its transitions went {steps:?}"
+            "task {id}: its record is {held:?} but its transitions went {steps:?}"
         ));
     }
     Ok(())

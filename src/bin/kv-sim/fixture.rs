@@ -9,6 +9,7 @@ use crate::keys::{
     self, Answer, Entry, Fact, FileFacts, Lease, Meta, Metric, OpId, Status, Task, Total,
     Transition,
 };
+use crate::roles::VLOG_THRESHOLD;
 
 const THREAD: &str = "tfixture";
 
@@ -19,8 +20,8 @@ fn op(role: char, pid: u32, n: u64) -> OpId {
 fn open(path: &Path) -> Result<Tree, String> {
     TreeBuilder::new()
         .with_path(path.to_path_buf())
-        .with_versioning(true, 0)
         .with_enable_vlog(true)
+        .with_vlog_value_threshold(VLOG_THRESHOLD)
         .build()
         .map_err(|e| e.to_string())
 }

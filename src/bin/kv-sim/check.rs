@@ -6,8 +6,7 @@
 //! - threads: journals from 1 to the head without a gap, epochs that never go back and
 //!   one process an epoch, an operation's entries together and as many as it wrote, and
 //!   nothing of a thread without its record;
-//! - tasks: transitions a path through the flow from `new`, the task its last step, its
-//!   versions its steps;
+//! - tasks: transitions a path through the flow from `new`, the task its last step;
 //! - index: every count of references the number of files that refer, every fact
 //!   referred to, nothing referred to missing;
 //! - metrics: the total the sum of the records.
@@ -28,6 +27,7 @@ use crate::keys::{
     self, Answer, Entry, Fact, FileFacts, Lease, Meta, Metric, OpId, Status, Task, Total,
     Transition,
 };
+use crate::roles::VLOG_THRESHOLD;
 use crate::roles::keeper::last_checkpoint;
 
 /// Something wrong the check found.
@@ -93,7 +93,6 @@ pub struct Model {
     pub leases: BTreeMap<String, Lease>,
     pub entries: BTreeMap<String, Vec<(u64, Entry)>>,
     pub tasks: BTreeMap<u64, Task>,
-    pub versions: BTreeMap<u64, Vec<Status>>,
     pub transitions: BTreeMap<u64, Vec<(u64, Transition)>>,
     pub facts: BTreeMap<String, OpId>,
     pub references: BTreeMap<String, u64>,
@@ -126,8 +125,8 @@ impl Model {
     pub async fn read(path: &Path) -> Result<Model, String> {
         let tree = TreeBuilder::new()
             .with_path(path.to_path_buf())
-            .with_versioning(true, 0)
             .with_enable_vlog(true)
+            .with_vlog_value_threshold(VLOG_THRESHOLD)
             .build()
             .map_err(|e| e.to_string())?;
         let model = Model::from_tree(&tree).map_err(|e| e.to_string());
@@ -224,21 +223,6 @@ impl Model {
                 model.answers.insert(event, answer);
             }
         })?;
-        for &id in model.tasks.keys() {
-            let key = keys::task(id);
-            let mut past = key.clone();
-            past.push(0);
-            let mut cursor = tx.history(key.as_slice(), past.as_slice())?;
-            let mut valid = cursor.seek_first()?;
-            let mut versions = Vec::new();
-            while valid {
-                if let Ok(task) = keys::decode::<Task>(&cursor.value()?) {
-                    versions.push(task.status);
-                }
-                valid = cursor.next()?;
-            }
-            model.versions.insert(id, versions);
-        }
         model.unreadable = bad;
         Ok(model)
     }
@@ -379,21 +363,6 @@ impl Model {
                         steps.len()
                     ),
                 )),
-            }
-            let mut tos: Vec<Status> = steps.iter().map(|(_, step)| step.to).collect();
-            tos.reverse();
-            if self
-                .versions
-                .get(id)
-                .is_some_and(|versions| *versions != tos)
-            {
-                found.push(finding(
-                    "task",
-                    format!(
-                        "task {id}: its versions are {:?} but its steps went {tos:?}",
-                        self.versions[id]
-                    ),
-                ));
             }
         }
         for id in self.tasks.keys() {

@@ -17,14 +17,20 @@ use crate::journal::Journal;
 use crate::keys::OpId;
 use crate::rng::Rng;
 
-/// The options every process of a run opens the database with. The memtable is 16 MiB,
-/// not SurrealKV's 100 MB, as for processes that come and go: each change of owner
-/// flushes it or replays its log.
+/// The values of this size and larger go to the value log; smaller ones stay in the
+/// tables, where a compaction gives back the space of what was replaced or removed.
+pub const VLOG_THRESHOLD: usize = 64 << 10;
+
+/// The options every process of a run opens the database with, Milou's: no history of
+/// versions; the value log for the rare values of `VLOG_THRESHOLD` and more only, as
+/// the space of a value in it is given back only once every value written before it is
+/// gone; and a memtable of 16 MiB, not SurrealKV's 100 MB, as for processes that come
+/// and go: each change of owner flushes it or replays its log.
 pub fn builder(run: &Path) -> TreeBuilder {
     TreeBuilder::new()
         .with_path(run.join("db"))
-        .with_versioning(true, 0)
         .with_enable_vlog(true)
+        .with_vlog_value_threshold(VLOG_THRESHOLD)
         .with_max_memtable_size(16 << 20)
         .with_run_dir(run.join("sock"))
         .with_call_timeout(Duration::from_secs(1))

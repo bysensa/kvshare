@@ -140,9 +140,11 @@ async fn turn(ctx: &mut Ctx, pid: u32, held: &Held) -> bool {
         let batch = ctx.rng.between(1, 10).min(left);
         let bodies = (0..batch)
             .map(|_| {
-                // Chunks of text, and now and then a tool call large enough for the
-                // value log.
-                let size = if ctx.rng.chance(5) {
+                // Chunks of text, now and then a tool call of a few KiB, and once in a
+                // thousand entries an output large enough for the value log.
+                let size = if ctx.rng.below(1_000) == 0 {
+                    ctx.rng.between(64 << 10, 128 << 10)
+                } else if ctx.rng.chance(5) {
                     ctx.rng.between(1_024, 4_096)
                 } else {
                     ctx.rng.between(20, 200)

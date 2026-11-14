@@ -10,8 +10,9 @@
 //!   SurrealKV alone does, which kvshare's owner keeps from happening by waiting for its
 //!   compactions before it closes.
 //!
-//! `kv-owner [MiB…]` writes a base of 256 MiB as `kv-sim` writes (versions kept, a fifth
-//! of the values large enough for the value log) and closes it. Then, for each amount of
+//! `kv-owner [MiB…]` writes a base of 256 MiB as `kv-sim` writes (no history, a value
+//! log for values of 64 KiB and more, a fifth of the values of 2 to 8 KiB) and closes
+//! it. Then, for each amount of
 //! writes left in the memtable (0, 8, 32 and 96 MiB unless given), three times: it writes
 //! the amount and closes, opens, writes it again and abandons the tree as a crash would,
 //! and opens. Last, with the largest amount in the memtable, it times the commits before,
@@ -235,8 +236,14 @@ async fn closes(
     );
 
     // A compaction under way when the tree closes, as when a short-lived owner leaves
-    // while it runs one for a client.
+    // while it runs one for a client. The keys are counted first, so that what goes
+    // missing after it is told from what went missing before.
     let tree = Arc::new(open(db)?);
+    let (keys, unreadable) = count(&tree)?;
+    println!(
+        "keys before the compaction: {keys} of {} written, {unreadable} unreadable",
+        writer.next
+    );
     let compacting = {
         let tree = Arc::clone(&tree);
         tokio::task::spawn_blocking(move || {
@@ -286,23 +293,7 @@ async fn closes(
             return Ok(());
         }
     };
-    let (keys, unreadable) = {
-        let tx = tree.begin()?;
-        let mut options = surrealkv::ReadOptions::new();
-        options.set_iterate_lower_bound(Some(b"k/".to_vec()));
-        options.set_iterate_upper_bound(Some(b"k0".to_vec()));
-        let mut cursor = tx.range_with_options(&options)?;
-        let (mut keys, mut unreadable) = (0u64, 0u64);
-        let mut valid = cursor.seek_first()?;
-        while valid {
-            keys += 1;
-            if cursor.value().is_err() {
-                unreadable += 1;
-            }
-            valid = cursor.next()?;
-        }
-        (keys, unreadable)
-    };
+    let (keys, unreadable) = count(&tree)?;
     tree.close().await?;
     println!(
         "  keys after both: {keys} of {} written, {unreadable} unreadable",
@@ -311,12 +302,33 @@ async fn closes(
     Ok(())
 }
 
-/// Open the tree in `dir` with the options `kv-sim` opens it with.
+/// The keys `Writer` wrote that `tree` holds, and how many of their values do not read.
+fn count(tree: &Tree) -> surrealkv::Result<(u64, u64)> {
+    let tx = tree.begin()?;
+    let mut options = surrealkv::ReadOptions::new();
+    options.set_iterate_lower_bound(Some(b"k/".to_vec()));
+    options.set_iterate_upper_bound(Some(b"k0".to_vec()));
+    let mut cursor = tx.range_with_options(&options)?;
+    let (mut keys, mut unreadable) = (0, 0);
+    let mut valid = cursor.seek_first()?;
+    while valid {
+        keys += 1;
+        if cursor.value().is_err() {
+            unreadable += 1;
+        }
+        valid = cursor.next()?;
+    }
+    Ok((keys, unreadable))
+}
+
+/// Open the tree in `dir` as `kv-sim` opens it, with no history and the value log for
+/// values of 64 KiB and more only (none here), but with SurrealKV's memtable of 100 MB,
+/// which the measurement fills to each amount.
 fn open(dir: &Path) -> surrealkv::Result<Tree> {
     TreeBuilder::new()
         .with_path(dir.to_path_buf())
-        .with_versioning(true, 0)
         .with_enable_vlog(true)
+        .with_vlog_value_threshold(64 << 10)
         .build()
 }
 
@@ -327,8 +339,8 @@ struct Writer {
 }
 
 impl Writer {
-    /// Write `bytes` of values: with `large`, a fifth of them of 2 to 8 KiB, which go to
-    /// the value log; otherwise all of 100 to 900 bytes, which stay in the memtable.
+    /// Write `bytes` of values: with `large`, a fifth of them of 2 to 8 KiB; otherwise all
+    /// of 100 to 900 bytes.
     async fn write(&mut self, tree: &Tree, bytes: usize, large: bool) -> surrealkv::Result<()> {
         let mut written = 0;
         while written < bytes {

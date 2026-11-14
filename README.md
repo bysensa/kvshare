@@ -259,27 +259,57 @@ load average of about 12, so slower than above throughout (medians, p99 in brack
 
 Every change of owner opens SurrealKV in the next owner, and an owner that leaves by
 `close` flushes its memtable first; one that crashed leaves the log of its memtable to
-replay. Both cost about 2 to 4.5 ms for each MiB the memtable holds. `kv-owner` on a
-base of 256 MiB, versions kept and the value log on, with a load average of 4 to 10
-(the range of three runs):
+replay. Both cost about 2.5 to 3.5 ms for each MiB the memtable holds. `kv-owner` on a
+base of 256 MiB written as `kv-sim` writes (no history, the value log for values of 64
+KiB and more, so none here), with a load average of about 5 (the range of three
+rounds):
 
 | In the memtable | `close` | open after a `close` | open after a crash |
 |---|---|---|---|
-| 0 MiB | 0.2–0.3 ms | 18–25 ms | 18–39 ms |
-| 8 MiB | 43–76 ms | 14–39 ms | 24–53 ms |
-| 32 MiB | 63–101 ms | 15–41 ms | 52–89 ms |
-| 96 MiB | 159–441 ms | 32–47 ms | 224–420 ms |
+| 0 MiB | 34–462 ms | 39–50 ms | 27–40 ms |
+| 8 MiB | 50–103 ms | 17–18 ms | 26–28 ms |
+| 32 MiB | 81–199 ms | 23–40 ms | 55–87 ms |
+| 96 MiB | 278–338 ms | 35–38 ms | 246–306 ms |
 
 SurrealKV's memtable is 100 MB unless set, which makes a change of owner cost up to
-about 0.4 s. Processes that come and go, each of which may become the owner, are better
-off with a memtable of 16 to 32 MiB (`with_max_memtable_size`): the open and the close
+about 0.35 s. Processes that come and go, each of which may become the owner, are better
+off with a memtable of 16 to 32 MiB (`with_max_memtable_size`): the flush and the replay
 then stay under about 0.1 s, for more frequent flushes.
 
-A `close` also waits for a checkpoint that runs and, in kvshare, for a compaction that
-runs (see the SurrealKV gaps above), so an owner that leaves during either leaves once
-it is done. Checkpoints and compactions do not hold up commits meanwhile: commits of
-200 bytes kept a p99 under 4 ms during a checkpoint and a compaction of the whole tree
-of 3.4 s.
+A `close` also waits for the compactions the writes before it started in the
+background, which move the values with the keys when they are not in the value log:
+that is the `close` of the first row, 462 ms right after the base was written and 34 ms
+two rounds later. It waits for a checkpoint that runs and, in kvshare, for a compaction
+a client asked for (see the SurrealKV gaps above), so an owner that leaves during either
+leaves once it is done. Checkpoints and compactions do not hold up commits meanwhile:
+commits of 200 bytes kept a p99 under 1 ms (78 ms at most) during a checkpoint and a
+compaction of the whole tree of 11.8 s.
+
+### What history and the value log cost
+
+SurrealKV 1.4.0 gives back the space of the value log a whole file at a time, and only
+the files older than the oldest one any table points into; it never moves live values
+out of an old file. One value that lives long keeps every file written after it.
+`kv-space`: 1000 keys of 4 KiB each written 25 times (3.9 MiB live, 97 MiB written),
+files of the value log of 4 MiB, after a compaction of the whole tree:
+
+| Value log | History | A key never replaced | Space | Compaction |
+|---|---|---|---|---|
+| on | none or 1 s | no | 6 MiB | 126–149 ms |
+| on | none or 1 s | yes | 98 MiB | 126–129 ms |
+| off | none or 1 s | either | 3 MiB | 130–179 ms |
+| on | for ever | either | 98 MiB | 139–143 ms |
+| off | for ever | either | 98 MiB | 509–513 ms |
+
+A history kept for ever keeps everything ever written, by design. Without the value
+log, a compaction gives the space back but rewrites the large values it moves: it
+costs more as more large values live (3.6 times as much with 98 MiB of them). With it,
+the space of data that does not die in the order it was written is never given back.
+
+Data that is replaced or removed in no particular order, a code index or threads
+removed one by one, is better kept with no history and with the value log off, or on
+with a high `with_vlog_value_threshold` (64 KiB and more) for the rare very large
+values only, which `kv-sim` does.
 
 ## Tests
 
@@ -314,7 +344,8 @@ cargo test
 `cargo run --release --bin kv-latency` prints the latencies. `cargo run --release --bin
 kv-owner` prints what an owner's work costs in SurrealKV itself: a close, an open after
 a close and after a crash by how much the memtable holds, the commits during a
-checkpoint and a compaction, and a close during each.
+checkpoint and a compaction, and a close during each. `cargo run --release --bin
+kv-space` prints what history and the value log cost in space and in time.
 
 ## The simulation
 
@@ -327,8 +358,8 @@ once, and checks the database against what each process says it did:
 - **agents**, which drive threads under leases with epochs, append to their journals in
   small batches and record metrics into a total all threads share;
 - **readers**, which follow journals with cursors and check what every snapshot must hold;
-- **an indexer** of facts kept by the hash of their content, a fifth of them large enough
-  for the value log, with counts of references;
+- **an indexer** of facts kept by the hash of their content, a fifth of them of 2 to 8
+  KiB and one in a hundred large enough for the value log, with counts of references;
 - **a keeper**, which checkpoints, compacts and removes closed threads;
 - **a conductor**, which kills a process every two seconds or so, the owner most of all,
   and stops the owner for one to three seconds every eight.
@@ -341,8 +372,9 @@ follow their flow, counts of references and the metrics' total add up, removed t
 are gone whole, every event has one answer, and the newest checkpoint holds together.
 The report gives the hooks' times by what the owner went through (calm, killed,
 stopped), every role's timings, the errors met, the processes' open files and memory,
-the space on disk, and the findings. The database keeps every version for ever, so it
-only grows; a run stops, and fails, when its disk has less than 2 GiB free.
+the space on disk, and the findings. The database is opened as Milou would open it: no
+history, the value log for values of 64 KiB and more, a memtable of 16 MiB. A run
+stops, and fails, when its disk has less than 2 GiB free.
 
 ```sh
 cargo run --release --bin kv-sim -- run --seconds 60 --keep
