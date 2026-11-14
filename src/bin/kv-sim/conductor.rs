@@ -3,7 +3,7 @@
 //! processes' files and memory, and at the end stops everything, checks the database
 //! against the journals and prints the report.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -131,6 +131,8 @@ pub async fn run(settings: Settings) -> Result<(), String> {
     let mut stops: Vec<(Instant, Instant)> = Vec::new();
     let mut kills: Vec<Instant> = Vec::new();
     let mut hook_pids: VecDeque<u32> = VecDeque::new();
+    // The hooks that have not ended yet.
+    let mut running_hooks: HashSet<u32> = HashSet::new();
     let mut events: VecDeque<u64> = VecDeque::new();
     let mut next_event = 0u64;
     let mut stopped: Option<(u32, Instant)> = None;
@@ -154,6 +156,7 @@ pub async fn run(settings: Settings) -> Result<(), String> {
             live.iter().filter_map(|p| p.child.id()).collect();
         while let Some(done) = hooks.try_join_next() {
             if let Ok(done) = done {
+                running_hooks.remove(&done.pid);
                 hook_times.push(done);
             }
         }
@@ -177,16 +180,17 @@ pub async fn run(settings: Settings) -> Result<(), String> {
                 };
                 let args = [rng.next_u64().to_string(), event.to_string()];
                 let mut child = spawn(&dir, "hook", &args)?;
-                if let Some(pid) = child.id() {
-                    hook_pids.push_back(pid);
-                    if hook_pids.len() > 64 {
-                        hook_pids.pop_front();
-                    }
+                let pid = child.id().unwrap_or(0);
+                hook_pids.push_back(pid);
+                if hook_pids.len() > 64 {
+                    hook_pids.pop_front();
                 }
+                running_hooks.insert(pid);
                 let spawned = Instant::now();
                 hooks.spawn(async move {
                     let status = child.wait().await;
                     HookRun {
+                        pid,
                         spawned,
                         took: spawned.elapsed(),
                         ok: status.is_ok_and(|s| s.success()),
@@ -255,9 +259,32 @@ pub async fn run(settings: Settings) -> Result<(), String> {
         }
     }
     std::fs::write(dir.join("stop"), b"").map_err(|e| e.to_string())?;
-    while let Some(done) = hooks.join_next().await {
-        if let Ok(done) = done {
-            hook_times.push(done);
+    // A hook still running `HOOKS_END` after the run's end is stuck: what it was doing
+    // goes to the logs, then it is killed and counted.
+    let until = tokio::time::Instant::now() + HOOKS_END;
+    let mut stuck_hooks = Vec::new();
+    loop {
+        match tokio::time::timeout_at(until, hooks.join_next()).await {
+            Ok(Some(done)) => {
+                if let Ok(done) = done {
+                    running_hooks.remove(&done.pid);
+                    hook_times.push(done);
+                }
+            }
+            Ok(None) => break,
+            Err(_) => {
+                for &pid in &running_hooks {
+                    describe(&dir, pid).await;
+                    signal("KILL", pid).await;
+                    stuck_hooks.push(pid);
+                }
+                while let Some(done) = hooks.join_next().await {
+                    if let Ok(done) = done {
+                        hook_times.push(done);
+                    }
+                }
+                break;
+            }
         }
     }
     let mut unended = 0;
@@ -306,6 +333,7 @@ pub async fn run(settings: Settings) -> Result<(), String> {
         least_free: least_free.load(Ordering::Relaxed),
         sockets,
         unended,
+        stuck_hooks,
         budget: settings.budget,
     };
     let failed = report::print(&dir, &run, &findings)?;
@@ -322,12 +350,38 @@ pub async fn run(settings: Settings) -> Result<(), String> {
     }
 }
 
-/// A hook as the conductor saw it: when it started, how long it ran, whether it ended
-/// well.
+/// A hook as the conductor saw it: its pid, when it started, how long it ran, whether it
+/// ended well.
 struct HookRun {
+    pid: u32,
     spawned: Instant,
     took: Duration,
     ok: bool,
+}
+
+/// How long the hooks still running at the run's end may take to end.
+const HOOKS_END: Duration = Duration::from_secs(30);
+
+/// Keep what the process `pid` is doing in `<dir>/logs`: its state, and on macOS a
+/// sample of its threads' stacks. Whatever fails to run leaves nothing.
+async fn describe(dir: &Path, pid: u32) {
+    let logs = dir.join("logs");
+    if let Ok(out) = Command::new("ps")
+        .args(["-o", "pid,stat,etime,command", "-p", &pid.to_string()])
+        .output()
+        .await
+    {
+        let _ = std::fs::write(logs.join(format!("stuck-{pid}.ps")), out.stdout);
+    }
+    let _ = Command::new("sample")
+        .arg(pid.to_string())
+        .arg("1")
+        .arg("-file")
+        .arg(logs.join(format!("stuck-{pid}.sample")))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
 }
 
 /// What the owner went through while a hook ran.

@@ -25,6 +25,8 @@ pub struct Run {
     pub least_free: u64,
     pub sockets: usize,
     pub unended: usize,
+    /// The hooks still running long after the run's end, which the conductor killed.
+    pub stuck_hooks: Vec<u32>,
     pub budget: bool,
 }
 
@@ -229,8 +231,10 @@ pub fn print(dir: &Path, run: &Run, found: &[Finding]) -> Result<bool, String> {
         leaks.extend(leak(*pid, series));
     }
     println!(
-        "left behind: {} socket files, {} processes that would not end",
-        run.sockets, run.unended
+        "left behind: {} socket files, {} processes that would not end, {} hooks stuck",
+        run.sockets,
+        run.unended,
+        run.stuck_hooks.len()
     );
     let mut parts: Vec<String> = std::fs::read_dir(dir.join("db"))
         .map(|entries| {
@@ -270,6 +274,13 @@ pub fn print(dir: &Path, run: &Run, found: &[Finding]) -> Result<bool, String> {
     }
     if run.unended > 0 {
         failures.push(format!("{} processes would not end", run.unended));
+    }
+    if !run.stuck_hooks.is_empty() {
+        failures.push(format!(
+            "hooks {:?} were still running long after the run's end; what they were \
+             doing is in logs/stuck-<pid>.*",
+            run.stuck_hooks
+        ));
     }
     let over = p99 > HOOK_BUDGET.as_micros();
     if over {

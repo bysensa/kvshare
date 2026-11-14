@@ -151,6 +151,62 @@ async fn opening_waits_for_a_stopped_owner_as_long_as_the_election_allows() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// An owner killed while it is stopped, with its socket's queue full of connections it
+/// never took, as when hooks keep coming while it is stopped: opening the database ends
+/// within the election timeout, and this process, which finds the lock free, owns the
+/// database. (A simulation once saw a connect here that the system never answered; this
+/// does not bring it about, and `connect` bounds the connection with the welcome.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn opening_ends_when_a_stopped_owner_is_killed() {
+    let base = base("stoppedkill");
+    let (db, run) = (base.join("db"), base.join("run"));
+    let (mut owner, said) = worker(&["serve", path(&db), path(&run)]).await;
+    assert_eq!(said, "owner", "the worker owns the database");
+    let pid = owner.id().expect("a running owner");
+    let socket = std::fs::read_dir(&run)
+        .expect("the run directory")
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "sock"))
+        .expect("the owner's socket");
+
+    signal("STOP", pid).await;
+    // More connections than the queue holds (128 on macOS), none of them taken.
+    let mut queued = Vec::new();
+    for _ in 0..200 {
+        let connecting = tokio::net::UnixStream::connect(&socket);
+        if let Ok(Ok(stream)) = tokio::time::timeout(Duration::from_millis(20), connecting).await {
+            queued.push(stream);
+        }
+    }
+    let opening = tokio::spawn(
+        TreeBuilder::new()
+            .with_path(db.clone())
+            .with_versioning(true, 0)
+            .with_run_dir(run.clone())
+            .with_call_timeout(Duration::from_millis(300))
+            .with_election_timeout(Duration::from_secs(3))
+            .build(),
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    signal("KILL", pid).await;
+    owner.wait().await.expect("the owner exits");
+    drop(queued);
+
+    let tree = tokio::time::timeout(Duration::from_secs(10), opening)
+        .await
+        .expect("opening ends within the election timeout, not never")
+        .expect("the opening task")
+        .expect("the database opens once the lock is free");
+    assert_eq!(
+        tree.owner_pid().await.expect("the owner"),
+        std::process::id(),
+        "this process owns the database"
+    );
+    tree.close().await.expect("the tree closes");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 /// A commit that came back `OwnerSilent` lands once the owner resumes, and a
 /// transaction the client begins after it sees it: the owner takes a snapshot only after
 /// the commits sent before it on the same connection are done. So a client unsure of a

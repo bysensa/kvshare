@@ -101,9 +101,11 @@ impl Inner {
     }
 }
 
-/// Connect to the owner's socket of `endpoint` and check its welcome, waited for at most
-/// `within`, against this process: the protocol, the database and the `fingerprint` of
-/// the options that must agree. The connection and the owner's pid.
+/// Connect to the owner's socket of `endpoint` and check its welcome against this
+/// process: the protocol, the database and the `fingerprint` of the options that must
+/// agree. The connection and the owner's pid. The connection and the welcome together
+/// take at most `within`: a connect the system never answers was seen on macOS, the
+/// owner gone, and it must not hold up an election for ever.
 ///
 /// An owner that is on its way in or out, see [`passing`], is an `Error::Io` of that
 /// kind; one that answers what this process cannot take is a `Handshake` or a mismatch.
@@ -112,10 +114,18 @@ pub(crate) async fn connect(
     fingerprint: [u8; 32],
     within: Duration,
 ) -> Result<(Arc<Connection>, u32)> {
-    let stream = UnixStream::connect(&endpoint.socket)
+    let deadline = tokio::time::Instant::now() + within;
+    let stream = tokio::time::timeout_at(deadline, UnixStream::connect(&endpoint.socket))
         .await
+        .map_err(|_| {
+            Error::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "no connection in time",
+            ))
+        })?
         .map_err(Error::Io)?;
-    let (connection, welcome) = Connection::open(stream, within).await.map_err(|error| {
+    let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+    let (connection, welcome) = Connection::open(stream, left).await.map_err(|error| {
         if passing(&error) {
             Error::Io(error)
         } else {
