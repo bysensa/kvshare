@@ -4,9 +4,10 @@
 mod common;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use common::{base, builder, close, owner_and_client};
-use kvshare::Error;
+use kvshare::{CompactRangeOptions, Error};
 
 /// The first tree to open the database owns it; the second works through it, sees its
 /// writes, and takes the database over when the first lets it go.
@@ -211,6 +212,107 @@ async fn a_client_takes_over_from_an_owner_that_crashes() {
     assert_eq!(value.as_deref(), Some(&b"before the crash"[..]));
     drop(tx);
     close(owner, client, &base).await;
+}
+
+/// An owner that leaves while it compacts the database waits for the compaction before
+/// it lets the database go. SurrealKV looks for a close only between the steps of a
+/// compaction and releases its lock in the middle of one: the next owner, opening the
+/// database at once, would have its files changed under it by the step that goes on,
+/// and the database could not be opened again. After both owners every key reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_owner_that_leaves_while_it_compacts_waits_for_the_compaction() {
+    // About 1 MiB a batch, a fifth of it in the value log. Six tables of 8 MiB, each
+    // flushed by a close, give the compaction a merge that lasts longer than the owner
+    // takes to leave; nothing is left to flush, so the merge starts at once. (A close
+    // during the flush that a compaction starts with is safe: the compaction looks for
+    // it before its first merge.)
+    const PER_BATCH: u64 = 700;
+    let key = |n: u64| format!("k/{n:010}").into_bytes();
+    let value = |n: u64| {
+        let size = if n.is_multiple_of(5) {
+            2048 + (n * 37 % 6144)
+        } else {
+            100 + (n * 13 % 800)
+        };
+        vec![(n % 251) as u8; size as usize]
+    };
+    let base = base("compactclose");
+    let open = || builder(&base).with_enable_vlog(true).build();
+    let mut written = 0;
+    let mut write = async |tree: &kvshare::Tree, batches: u64| {
+        for _ in 0..batches {
+            let mut tx = tree.begin().await.expect("a transaction");
+            for _ in 0..PER_BATCH {
+                tx.set(key(written), value(written)).expect("a write");
+                written += 1;
+            }
+            tx.commit().await.expect("a commit");
+        }
+    };
+    for _ in 0..6 {
+        let tree = open().await.expect("a tree");
+        write(&tree, 8).await;
+        tree.close().await.expect("the tree closes");
+    }
+    let owner = open().await.expect("the owner");
+    let client = open().await.expect("the client");
+
+    let compacting = {
+        let owner = owner.clone();
+        let options = CompactRangeOptions {
+            flush_memtable: false,
+            ..CompactRangeOptions::default()
+        };
+        tokio::spawn(async move { owner.compact_range(None, None, &options).await })
+    };
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    owner.close().await.expect("the owner closes");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(
+        compacting.is_finished(),
+        "the owner let the database go while it compacted"
+    );
+    let _ = compacting.await;
+
+    // The client takes the database over at once, writes and leaves.
+    let mut tx = loop {
+        match client.begin().await {
+            Ok(tx) => match tx.get(b"k/").await {
+                Ok(_) => break tx,
+                Err(Error::OwnerLost(_)) => continue,
+                Err(other) => panic!("the client could not take over: {other}"),
+            },
+            Err(Error::OwnerLost(_)) => continue,
+            Err(other) => panic!("the client could not take over: {other}"),
+        }
+    };
+    assert!(tx.is_local(), "the client became the owner");
+    for _ in 0..PER_BATCH {
+        tx.set(key(written), value(written)).expect("a write");
+        written += 1;
+    }
+    tx.commit().await.expect("a commit");
+    client.close().await.expect("the client closes");
+
+    let reopened = open().await.expect("the database opens again");
+    let tx = reopened.begin().await.expect("a transaction");
+    let mut cursor = tx
+        .range(b"k/".as_slice(), b"k0".as_slice())
+        .expect("a cursor");
+    let mut valid = cursor.seek_first().await.expect("a seek");
+    let mut keys = 0;
+    while valid {
+        let n = keys;
+        assert_eq!(cursor.key().user_key(), key(n).as_slice(), "key {n}");
+        assert_eq!(cursor.value().expect("a value"), value(n), "value {n}");
+        keys += 1;
+        valid = cursor.next().await.expect("a move");
+    }
+    assert_eq!(keys, written, "every key written is there");
+    drop(cursor);
+    drop(tx);
+    reopened.close().await.expect("the tree closes");
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// A process whose options change what is stored (here, whether versions are kept)

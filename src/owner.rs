@@ -12,7 +12,7 @@ use tokio::io::BufReader;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::task::{JoinHandle, JoinSet};
 
-use crate::admin::run_blocking;
+use crate::admin::{Maintenance, run_blocking};
 use crate::endpoint::Endpoint;
 use crate::error::KvError;
 use crate::exec::{apply, page};
@@ -28,6 +28,8 @@ use crate::types::{WireDurability, WireMode};
 /// SurrealKV `Tree` closes the database.
 pub(crate) struct Owner {
     tree: Arc<Tree>,
+    /// Held by every operation on the whole database while it runs; see [`Maintenance`].
+    maintenance: Maintenance,
     socket: PathBuf,
     accept: JoinHandle<()>,
 }
@@ -61,9 +63,16 @@ impl Owner {
             fingerprint,
         });
         let tree = Arc::new(tree);
-        let accept = tokio::spawn(accept(listener, Arc::clone(&tree), welcome));
+        let maintenance = Maintenance::default();
+        let accept = tokio::spawn(accept(
+            listener,
+            Arc::clone(&tree),
+            Arc::clone(&maintenance),
+            welcome,
+        ));
         Ok(Owner {
             tree,
+            maintenance,
             socket: endpoint.socket.clone(),
             accept,
         })
@@ -74,6 +83,11 @@ impl Owner {
         &self.tree
     }
 
+    /// What this process's own operations on the whole database hold while they run.
+    pub(crate) fn maintenance(&self) -> &Maintenance {
+        &self.maintenance
+    }
+
     /// Let the database go as a crash does: stop serving at once and abandon SurrealKV,
     /// which releases the lock and flushes nothing. The socket file stays, as after a
     /// crash, and the next owner removes it.
@@ -82,14 +96,18 @@ impl Owner {
         self.tree.abandon();
     }
 
-    /// Hand the database over: stop serving, remove the socket and close the tree.
+    /// Hand the database over: stop serving, wait for the operations on the whole
+    /// database that run, remove the socket and close the tree.
     ///
     /// The clients lose their connections, their open transactions are rolled back,
-    /// and they elect the next owner once the lock is released.
+    /// and they elect the next owner once the lock is released. A compaction under way
+    /// is waited for to its end, see [`Maintenance`]; one asked for meanwhile finds the
+    /// tree closed.
     pub(crate) async fn close(self) -> Result<(), surrealkv::Error> {
         // Aborting the accept task drops its set of connections, which aborts them.
         self.accept.abort();
         let _ = self.accept.await;
+        let _quiet = self.maintenance.write().await;
         let _ = std::fs::remove_file(&self.socket);
         self.tree.close().await
     }
@@ -97,12 +115,22 @@ impl Owner {
 
 /// Take connections until the task is aborted; each connection is served by a task
 /// of its own, which the set aborts when it is dropped.
-async fn accept(listener: UnixListener, tree: Arc<Tree>, welcome: Arc<Welcome>) {
+async fn accept(
+    listener: UnixListener,
+    tree: Arc<Tree>,
+    maintenance: Maintenance,
+    welcome: Arc<Welcome>,
+) {
     let mut connections = JoinSet::new();
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
-                connections.spawn(serve(stream, Arc::clone(&tree), Arc::clone(&welcome)));
+                connections.spawn(serve(
+                    stream,
+                    Arc::clone(&tree),
+                    Arc::clone(&maintenance),
+                    Arc::clone(&welcome),
+                ));
             }
             // Out of descriptors, or a connection reset before it was taken: wait a
             // little rather than spin on an error that repeats.
@@ -123,7 +151,12 @@ async fn accept(listener: UnixListener, tree: Arc<Tree>, welcome: Arc<Welcome>) 
 /// does not find it absent and then present. When the client goes away, its table is
 /// dropped, which rolls back what it left open, and the work already started runs to its
 /// end.
-async fn serve(stream: UnixStream, tree: Arc<Tree>, welcome: Arc<Welcome>) {
+async fn serve(
+    stream: UnixStream,
+    tree: Arc<Tree>,
+    maintenance: Maintenance,
+    welcome: Arc<Welcome>,
+) {
     let (read, write) = stream.into_split();
     let writer = Arc::new(tokio::sync::Mutex::new(write));
     if write_frame(&mut *writer.lock().await, &*welcome)
@@ -224,8 +257,9 @@ async fn serve(stream: UnixStream, tree: Arc<Tree>, welcome: Arc<Welcome>) {
             },
             Request::Admin(admin) => {
                 let (tree, writer) = (Arc::clone(&table.tree), Arc::clone(&writer));
+                let maintenance = Arc::clone(&maintenance);
                 running.spawn(async move {
-                    let answer = match run_blocking(tree, admin).await {
+                    let answer = match run_blocking(tree, &maintenance, admin).await {
                         Ok(reply) => Answer::Admin(reply),
                         Err(error) => Answer::Failed(error),
                     };

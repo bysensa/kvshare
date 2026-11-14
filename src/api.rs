@@ -25,7 +25,7 @@ use surrealkv::{
 };
 
 use crate::admin::{
-    Admin, BackgroundError, CheckpointMetadata, EncryptionStatus, Reply, run_blocking,
+    Admin, BackgroundError, CheckpointMetadata, EncryptionStatus, Maintenance, Reply, run_blocking,
 };
 use crate::client::{Connection, Lost};
 use crate::cursor::Cursor;
@@ -262,6 +262,7 @@ pub(crate) struct Inner {
 enum Route {
     Local {
         tree: Arc<surrealkv::Tree>,
+        maintenance: Maintenance,
         generation: u64,
     },
     Remote {
@@ -283,6 +284,7 @@ impl Inner {
         Ok(match &current.role {
             Role::Owner(owner) => Route::Local {
                 tree: Arc::clone(owner.tree()),
+                maintenance: Arc::clone(owner.maintenance()),
                 generation: current.generation,
             },
             Role::Client {
@@ -357,9 +359,9 @@ impl Tree {
     pub async fn begin_with_mode(&self, mode: Mode) -> Result<Transaction> {
         let wire_mode = WireMode::of(mode)?;
         let (generation, state) = match self.inner.route().await? {
-            Route::Local { tree, generation } => {
-                (generation, State::Local(tree.begin_with_mode(mode)?))
-            }
+            Route::Local {
+                tree, generation, ..
+            } => (generation, State::Local(tree.begin_with_mode(mode)?)),
             Route::Remote {
                 connection,
                 owner_pid,
@@ -550,7 +552,9 @@ impl Tree {
     /// A client waits for an operation that takes long for as long as it takes.
     async fn admin(&self, admin: Admin) -> Result<Reply> {
         match self.inner.route().await? {
-            Route::Local { tree, .. } => Ok(run_blocking(tree, admin).await?),
+            Route::Local {
+                tree, maintenance, ..
+            } => Ok(run_blocking(tree, &maintenance, admin).await?),
             Route::Remote {
                 connection,
                 owner_pid,

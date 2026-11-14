@@ -181,18 +181,32 @@ pub(crate) struct Usage {
     wal: FileTotals,
 }
 
-/// Run `admin` on `tree` on a thread that may block, and wait for its answer.
+/// What the owner closes the tree past: every operation on the whole database holds it
+/// to read while it runs, and the close takes it to write, so the tree closes only once
+/// they are done. SurrealKV looks for a close only between the steps of a compaction and
+/// releases its lock in the middle of one; the next owner would open the database while
+/// the step goes on changing its files.
+pub(crate) type Maintenance = Arc<tokio::sync::RwLock<()>>;
+
+/// Run `admin` on `tree` on a thread that may block, holding `maintenance` to read until
+/// it ends, and wait for its answer. The thread holds it, not the waiting task: a task
+/// that is aborted (its client went away) leaves the operation running, and holding.
 pub(crate) async fn run_blocking(
     tree: Arc<Tree>,
+    maintenance: &Maintenance,
     admin: Admin,
 ) -> std::result::Result<Reply, KvError> {
-    tokio::task::spawn_blocking(move || run(&tree, admin))
-        .await
-        .unwrap_or_else(|_| {
-            Err(KvError::Engine(
-                "an operation on the database panicked".into(),
-            ))
-        })
+    let held = Arc::clone(maintenance).read_owned().await;
+    tokio::task::spawn_blocking(move || {
+        let _held = held;
+        run(&tree, admin)
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(KvError::Engine(
+            "an operation on the database panicked".into(),
+        ))
+    })
 }
 
 /// Run `admin` on `tree`. Blocking.

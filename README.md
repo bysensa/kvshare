@@ -207,6 +207,13 @@ answer, a value or an error, to be the same.
 - `CheckpointMetadata` lies in a private module, and `BackgroundError`, `EncryptionStatus`,
   `KeyUsage` and `FileTotals` are `#[non_exhaustive]`: kvshare has its own, with the
   same fields.
+- `close` releases the lock while a `compact_range` started before it goes on: the
+  compaction looks for the close only between its steps. A process that opens the
+  database meanwhile has its files changed under it by the step, and the database may
+  not open again (`LoadManifestFail`). kvshare's owner waits for every operation on the
+  whole database that runs, its own or a client's, before it closes, so an owner that
+  leaves during a compaction leaves only once it is done. `kv-owner` shows what
+  SurrealKV alone does.
 
 A restore with a transaction open goes as in SurrealKV, which `tests/differential.rs`
 pins: the transaction reads the restored database from then on, with its own writes,
@@ -258,8 +265,9 @@ cargo test
   among them every operation on the whole database, a restore with a transaction open,
   and cursors over keys only.
 - `tests/handover.rs`: the election, hand-over, conflicts, a client's own writes, many
-  tasks of one client, a client that leaves, an owner that crashes, a client with other
-  options, the bound on open transactions.
+  tasks of one client, a client that leaves, an owner that crashes, an owner that
+  leaves while it compacts, a client with other options, the bound on open
+  transactions.
 - `tests/scan.rs`: cursors over ranges and histories in pages, the same in the owner
   and through the socket; a reversed range; a history of a tree without versions; a
   cursor over keys only; a cursor moved in a spawned task.
@@ -277,7 +285,10 @@ cargo test
 - `tests/sim.rs`: the simulation below; its checks find every fault put into a run made
   by hand, and a run of 30 seconds finds nothing wrong.
 
-`cargo run --release --bin kv-latency` prints the latencies.
+`cargo run --release --bin kv-latency` prints the latencies. `cargo run --release --bin
+kv-owner` prints what an owner's work costs in SurrealKV itself: a close, an open after
+a close and after a crash by how much the memtable holds, the commits during a
+checkpoint and a compaction, and a close during each.
 
 ## The simulation
 
