@@ -259,8 +259,43 @@ cargo test
   and again; `KVSHARE_FAILOVER_SECONDS` makes it run longer than 6 seconds.
 - Unit tests: frames, endpoints, a write stall across the socket, and a client that
   refuses an owner of another protocol version, another database or other options.
+- `tests/sim.rs`: the simulation below; its checks find every fault put into a run made
+  by hand, and a run of 30 seconds finds nothing wrong.
 
 `cargo run --release --bin kv-latency` prints the latencies.
+
+## The simulation
+
+`kv-sim` puts the heaviest load Milou could put on one database, from many processes at
+once, and checks the database against what each process says it did:
+
+- **hooks**, short-lived processes in bursts of 1 to 8 every 20 to 50 ms, any of which may
+  become the owner for a moment; each answers an event (an event that comes again gets
+  the answer it got) and moves a task along its flow;
+- **agents**, which drive threads under leases with epochs, append to their journals in
+  small batches and record metrics into a total all threads share;
+- **readers**, which follow journals with cursors and check what every snapshot must hold;
+- **an indexer** of facts kept by the hash of their content, a fifth of them large enough
+  for the value log, with counts of references;
+- **a keeper**, which checkpoints, compacts and removes closed threads;
+- **a conductor**, which kills a process every two seconds or so, the owner most of all,
+  and stops the owner for one to three seconds every eight.
+
+Each process journals what it began and what it saw committed, in lines that survive
+`kill -9`; a commit whose answer was lost is read back before it is tried again. At the
+end the database is opened with SurrealKV itself and checked: nothing acknowledged is
+lost, nothing is applied twice, journals have no gaps and one writer an epoch, tasks
+follow their flow, counts of references and the metrics' total add up, removed threads
+are gone whole, every event has one answer, and the newest checkpoint holds together.
+The report gives the hooks' times by what the owner went through (calm, killed,
+stopped), every role's timings, the errors met, the processes' open files and memory,
+the space on disk, and the findings. The database keeps every version for ever, so it
+only grows; a run stops, and fails, when its disk has less than 2 GiB free.
+
+```sh
+cargo run --release --bin kv-sim -- run --seconds 60 --keep
+KVSHARE_SIM_SECONDS=600 cargo test --release --test sim -- --nocapture
+```
 
 ## License
 
