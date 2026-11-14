@@ -1,0 +1,168 @@
+//! Who owns the database: the election, and the role a process holds after it.
+//!
+//! The election is SurrealKV's own lock. A process opens the database: if it can, it
+//! is the owner and starts serving; if the database is locked, it connects to the
+//! owner's socket. A socket that is missing or refuses means the owner is starting or
+//! has just died: the process waits a little and opens again. A client that loses its
+//! owner forgets it, and its next transaction runs the election again.
+
+use std::hash::{BuildHasher, RandomState};
+use std::io;
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
+
+use surrealkv::{Tree, TreeBuilder};
+use tokio::net::UnixStream;
+
+use crate::client::Connection;
+use crate::owner::Owner;
+use crate::protocol::VERSION;
+use crate::shared::{Error, Shared};
+
+/// This process's part in a shared database.
+pub(crate) enum Role {
+    Owner(Owner),
+    Client {
+        connection: Arc<Connection>,
+        owner_pid: u32,
+    },
+}
+
+/// The role this process holds now; `generation` tells a role from the one after it.
+pub(crate) struct Current {
+    pub(crate) generation: u64,
+    pub(crate) role: Role,
+}
+
+impl Shared {
+    /// The pid of the process that owns the database now, asked over its socket. This
+    /// process takes no part in the election and keeps no connection.
+    ///
+    /// SurrealKV's lock file is no witness: every process that tries to open the
+    /// database truncates it before it tries the lock, which erases the owner's pid.
+    pub async fn current_owner(&self) -> Result<u32, Error> {
+        Ok(self.connect().await?.1)
+    }
+
+    /// The role held now, after an election if none is.
+    pub(crate) async fn held<'c>(
+        &self,
+        current: &'c mut Option<Current>,
+    ) -> Result<&'c Current, Error> {
+        if current.is_none() {
+            let role = self.elect().await?;
+            *current = Some(Current {
+                generation: self.generations.fetch_add(1, Ordering::Relaxed) + 1,
+                role,
+            });
+        }
+        Ok(current.as_ref().expect("a role was just elected"))
+    }
+
+    /// Drop the role of `generation`, unless a later one has replaced it.
+    pub(crate) async fn forget(&self, generation: u64) {
+        let mut current = self.current.lock().await;
+        if current
+            .as_ref()
+            .is_some_and(|held| held.generation == generation)
+        {
+            *current = None;
+        }
+    }
+
+    /// Open the database and own it, or connect to the process that does.
+    async fn elect(&self) -> Result<Role, Error> {
+        let started = Instant::now();
+        loop {
+            match open(&self.endpoint.db, self.options.versioning).await {
+                Ok(tree) => {
+                    let owner = Owner::start(tree, &self.endpoint).map_err(Error::Io)?;
+                    return Ok(Role::Owner(owner));
+                }
+                Err(error) if is_locked(&error) => match self.connect().await {
+                    Ok((connection, owner_pid)) => {
+                        return Ok(Role::Client {
+                            connection,
+                            owner_pid,
+                        });
+                    }
+                    // The owner holds the lock but has not bound its socket yet, or
+                    // has just died and left the file: open again after a pause.
+                    Err(Error::Io(error))
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                        ) => {}
+                    Err(other) => return Err(other),
+                },
+                Err(error) => return Err(error.into()),
+            }
+            if started.elapsed() >= self.options.elect_within {
+                return Err(Error::NoOwner {
+                    waited: started.elapsed(),
+                });
+            }
+            tokio::time::sleep(jitter(Duration::from_millis(5), Duration::from_millis(50))).await;
+        }
+    }
+
+    /// Connect to the owner's socket and check its welcome: the connection and the
+    /// owner's pid.
+    async fn connect(&self) -> Result<(Arc<Connection>, u32), Error> {
+        let stream = UnixStream::connect(&self.endpoint.socket)
+            .await
+            .map_err(Error::Io)?;
+        let (connection, welcome) = Connection::open(stream, self.options.call_within)
+            .await
+            .map_err(|error| Error::Handshake(error.to_string()))?;
+        if welcome.version != VERSION {
+            return Err(Error::Handshake(format!(
+                "the owner speaks v{}, this process v{VERSION}",
+                welcome.version
+            )));
+        }
+        if welcome.db != self.endpoint.db {
+            return Err(Error::Handshake(format!(
+                "the owner holds {}, not {}",
+                welcome.db.display(),
+                self.endpoint.db.display()
+            )));
+        }
+        Ok((Arc::new(connection), welcome.owner_pid))
+    }
+}
+
+/// Open the tree at `db`, off the async threads: opening reads and may recover files.
+async fn open(db: &Path, versioning: Option<u64>) -> surrealkv::Result<Tree> {
+    let db = db.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let builder = TreeBuilder::new().with_path(db);
+        match versioning {
+            Some(retention_ns) => builder.with_versioning(true, retention_ns),
+            None => builder,
+        }
+        .build()
+    })
+    .await
+    .expect("opening the tree does not panic")
+}
+
+/// Whether opening failed because another process holds the database.
+///
+/// SurrealKV 1.4 answers with `Error::Other("... already locked by another process")`
+/// on the operating system's files; `is_database_locked` is true only for the
+/// browser's file system. The text is the only sign there is.
+fn is_locked(error: &surrealkv::Error) -> bool {
+    error.is_database_locked()
+        || matches!(error, surrealkv::Error::Other(message) if message.contains("already locked"))
+}
+
+/// A pause between `low` and `high`, different in every process, so that processes
+/// that lost the same owner do not open the database in step.
+fn jitter(low: Duration, high: Duration) -> Duration {
+    let spread = (high - low).as_nanos() as u64;
+    let draw = RandomState::new().hash_one(Instant::now());
+    low + Duration::from_nanos(draw % spread.max(1))
+}

@@ -1,0 +1,14 @@
+[package]
+name = "kvshare"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+description = "One SurrealKV database shared by several processes on one machine: one process owns it, elected by SurrealKV's own lock, and the others work through it over a Unix socket."
+
+[dependencies]
+blake3 = "1.8"
+postcard = { version = "1.1", default-features = false, features = ["use-std"] }
+serde = { version = "1", features = ["derive"] }
+surrealkv = "=1.4.0"
+tokio = { version = "1.52", features = ["io-util", "macros", "net", "process", "rt", "rt-multi-thread", "sync", "time"] }
