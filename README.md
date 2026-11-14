@@ -255,6 +255,32 @@ load average of about 12, so slower than above throughout (medians, p99 in brack
 | reading the values | 0.90 ms (3.8) | 28.9 ms (41.4) |
 | keys only (`set_keys_only`) | 0.09 ms (0.10) | 0.21 ms (0.46) |
 
+### What a change of owner costs
+
+Every change of owner opens SurrealKV in the next owner, and an owner that leaves by
+`close` flushes its memtable first; one that crashed leaves the log of its memtable to
+replay. Both cost about 2 to 4.5 ms for each MiB the memtable holds. `kv-owner` on a
+base of 256 MiB, versions kept and the value log on, with a load average of 4 to 10
+(the range of three runs):
+
+| In the memtable | `close` | open after a `close` | open after a crash |
+|---|---|---|---|
+| 0 MiB | 0.2–0.3 ms | 18–25 ms | 18–39 ms |
+| 8 MiB | 43–76 ms | 14–39 ms | 24–53 ms |
+| 32 MiB | 63–101 ms | 15–41 ms | 52–89 ms |
+| 96 MiB | 159–441 ms | 32–47 ms | 224–420 ms |
+
+SurrealKV's memtable is 100 MB unless set, which makes a change of owner cost up to
+about 0.4 s. Processes that come and go, each of which may become the owner, are better
+off with a memtable of 16 to 32 MiB (`with_max_memtable_size`): the open and the close
+then stay under about 0.1 s, for more frequent flushes.
+
+A `close` also waits for a checkpoint that runs and, in kvshare, for a compaction that
+runs (see the SurrealKV gaps above), so an owner that leaves during either leaves once
+it is done. Checkpoints and compactions do not hold up commits meanwhile: commits of
+200 bytes kept a p99 under 4 ms during a checkpoint and a compaction of the whole tree
+of 3.4 s.
+
 ## Tests
 
 ```sh

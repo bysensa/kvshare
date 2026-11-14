@@ -17,12 +17,15 @@ use crate::journal::Journal;
 use crate::keys::OpId;
 use crate::rng::Rng;
 
-/// The options every process of a run opens the database with.
+/// The options every process of a run opens the database with. The memtable is 16 MiB,
+/// not SurrealKV's 100 MB, as for processes that come and go: each change of owner
+/// flushes it or replays its log.
 pub fn builder(run: &Path) -> TreeBuilder {
     TreeBuilder::new()
         .with_path(run.join("db"))
         .with_versioning(true, 0)
         .with_enable_vlog(true)
+        .with_max_memtable_size(16 << 20)
         .with_run_dir(run.join("sock"))
         .with_call_timeout(Duration::from_secs(1))
         .with_election_timeout(Duration::from_secs(5))
