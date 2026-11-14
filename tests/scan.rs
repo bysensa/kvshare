@@ -1,11 +1,11 @@
-//! Range and history reads in the owner's process and through its socket: the same
-//! answers either way, whatever the size of a page. See `common` for how one process
-//! plays an owner and a client.
+//! Cursors over ranges and histories in the owner's process and through its socket: the
+//! same answers either way, whatever the size of a page. See `common` for how one process
+//! plays an owner and a client; `differential.rs` compares cursors with SurrealKV's own.
 
 mod common;
 
 use common::{base, close, owner_and_client};
-use kvshare::{Tree, Version};
+use kvshare::{Cursor, HistoryOptions, Tree};
 
 /// The ten keys `k00`..`k09` the range tests read.
 fn ten_keys() -> Vec<String> {
@@ -22,69 +22,70 @@ async fn write_ten_keys(tree: &Tree) {
     tx.commit().await.expect("a commit");
 }
 
-/// Every entry of `[start, end)` that a new transaction of `tree` sees, read in pages
-/// of `page` entries.
-async fn range(
-    tree: &Tree,
-    start: &[u8],
-    end: &[u8],
-    reverse: bool,
-    page: usize,
-) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let mut tx = tree.begin().await.expect("a transaction");
-    let mut entries = Vec::new();
-    let mut scan = tx.range(start, end).page(page);
-    if reverse {
-        scan = scan.reverse();
+/// One entry of a cursor: the key, the time and the value, `None` for a tombstone.
+type Seen = (String, u64, Option<String>);
+
+/// Every entry of `cursor`, from the first forwards or from the last backwards.
+async fn walk(cursor: &mut Cursor<'_>, backwards: bool) -> Vec<Seen> {
+    let mut valid = if backwards {
+        cursor.seek_last().await
+    } else {
+        cursor.seek_first().await
     }
-    while let Some(entry) = scan.next().await.expect("a page") {
-        entries.push(entry);
+    .expect("a seek");
+    let mut seen = Vec::new();
+    while valid {
+        let key = cursor.key();
+        let value = (!key.is_tombstone())
+            .then(|| String::from_utf8_lossy(&cursor.value().expect("a value")).into_owned());
+        seen.push((
+            String::from_utf8_lossy(key.user_key()).into_owned(),
+            key.timestamp(),
+            value,
+        ));
+        valid = if backwards {
+            cursor.prev().await
+        } else {
+            cursor.next().await
+        }
+        .expect("a move");
     }
-    entries
+    seen
 }
 
-/// Every version of the keys of `[start, end)` that a new transaction of `tree` sees,
-/// read in pages of `page` versions, with tombstones or not, between two times or not.
+/// Every entry of `[start, end)` that a new transaction of `tree` sees, read in pages of
+/// `page` entries.
+async fn range(tree: &Tree, start: &[u8], end: &[u8], backwards: bool, page: usize) -> Vec<Seen> {
+    let tx = tree.begin().await.expect("a transaction");
+    let mut cursor = tx.range(start, end).expect("a cursor");
+    cursor.set_page_size(page);
+    walk(&mut cursor, backwards).await
+}
+
+/// Every version of the keys of `[start, end)` that a new transaction of `tree` sees, read
+/// in pages of `page` versions.
 async fn history(
     tree: &Tree,
     (start, end): (&[u8], &[u8]),
-    tombstones: bool,
-    between: Option<(u64, u64)>,
+    options: &HistoryOptions,
     page: usize,
-) -> Vec<Version> {
-    let mut tx = tree.begin().await.expect("a transaction");
-    let mut versions = Vec::new();
-    let mut read = tx.history(start, end).page(page);
-    if tombstones {
-        read = read.with_tombstones();
-    }
-    if let Some((from, to)) = between {
-        read = read.between(from, to);
-    }
-    while let Some(version) = read.next().await.expect("a page") {
-        versions.push(version);
-    }
-    versions
+) -> Vec<Seen> {
+    let tx = tree.begin().await.expect("a transaction");
+    let mut cursor = tx
+        .history_with_options(start, end, options)
+        .expect("a cursor");
+    cursor.set_page_size(page);
+    walk(&mut cursor, false).await
 }
 
-fn keys(entries: &[(Vec<u8>, Vec<u8>)]) -> Vec<String> {
-    entries
-        .iter()
-        .map(|(key, _)| String::from_utf8_lossy(key).into_owned())
-        .collect()
+fn keys(seen: &[Seen]) -> Vec<String> {
+    seen.iter().map(|(key, ..)| key.clone()).collect()
 }
 
 /// Each version as `key=value`, or `key=-` for a tombstone.
-fn shown(versions: &[Version]) -> Vec<String> {
-    versions
-        .iter()
-        .map(|version| {
-            let value = version
-                .value
-                .as_deref()
-                .map_or("-".into(), String::from_utf8_lossy);
-            format!("{}={value}", String::from_utf8_lossy(&version.key))
-        })
+fn shown(seen: &[Seen]) -> Vec<String> {
+    seen.iter()
+        .map(|(key, _, value)| format!("{key}={}", value.as_deref().unwrap_or("-")))
         .collect()
 }
 
@@ -96,22 +97,19 @@ async fn a_range_reads_the_same_in_pages_in_the_owner_and_through_the_socket() {
     let (owner, client) = owner_and_client(&base).await;
     write_ten_keys(&client).await;
 
-    for reverse in [false, true] {
+    for backwards in [false, true] {
         let mut expected = ten_keys();
-        if reverse {
+        if backwards {
             expected.reverse();
         }
         for page in [1, 3, 1000] {
             for (who, tree) in [("owner", &owner), ("client", &client)] {
-                let entries = range(tree, b"k", b"l", reverse, page).await;
-                assert_eq!(
-                    keys(&entries),
-                    expected,
-                    "{who}, reverse {reverse}, page {page}"
-                );
+                let seen = range(tree, b"k", b"l", backwards, page).await;
+                assert_eq!(keys(&seen), expected, "{who}, {backwards}, page {page}");
                 assert!(
-                    entries.iter().all(|(key, value)| key[1..] == value[1..]),
-                    "{who}: each value goes with its key"
+                    seen.iter().all(|(key, at, value)| *at == 0
+                        && value.as_deref().map(|v| &v[1..]) == Some(&key[1..])),
+                    "{who}: each value goes with its key, and a range reports no time"
                 );
             }
         }
@@ -119,10 +117,11 @@ async fn a_range_reads_the_same_in_pages_in_the_owner_and_through_the_socket() {
     close(owner, client, &base).await;
 }
 
-/// A client's scan sees the writes its transaction has not sent yet, which go to the
-/// owner with it; the owner's other transactions see them only after the commit.
+/// A client's cursor sees the writes its transaction has not sent yet, which go to the
+/// owner with its first page; the owner's other transactions see them only after the
+/// commit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_remote_range_sees_its_own_writes_which_others_see_after_the_commit() {
+async fn a_remote_cursor_sees_its_own_writes_which_others_see_after_the_commit() {
     let base = base("own-writes");
     let (owner, client) = owner_and_client(&base).await;
     write_ten_keys(&owner).await;
@@ -131,26 +130,20 @@ async fn a_remote_range_sees_its_own_writes_which_others_see_after_the_commit() 
     tx.set(b"k03", b"new").expect("a write");
     tx.delete(b"k05").expect("a delete");
     tx.set(b"k10", b"v10").expect("a write");
-    let mut seen = Vec::new();
-    {
-        let mut scan = tx.range(b"k", b"l").page(3);
-        while let Some(entry) = scan.next().await.expect("a page") {
-            seen.push(entry);
-        }
-    }
+    let seen = {
+        let mut cursor = tx.range(b"k", b"l").expect("a cursor");
+        cursor.set_page_size(3);
+        walk(&mut cursor, false).await
+    };
     let mut expected = ten_keys();
     expected.retain(|key| key != "k05");
     expected.push("k10".into());
     assert_eq!(keys(&seen), expected);
-    assert_eq!(seen[3], (b"k03".to_vec(), b"new".to_vec()));
+    assert_eq!(seen[3], ("k03".into(), 0, Some("new".into())));
 
-    // The writes went to the owner with the scan: point reads now ask the owner, whose
-    // transaction has them.
+    // The writes went to the owner with the first page: point reads now ask the owner,
+    // whose transaction has them.
     assert_eq!(tx.get(b"k05").await.expect("a get"), None);
-    assert_eq!(
-        tx.get(b"k03").await.expect("a get").as_deref(),
-        Some(&b"new"[..])
-    );
     let others = range(&owner, b"k", b"l", false, 1000).await;
     assert_eq!(
         keys(&others),
@@ -158,36 +151,37 @@ async fn a_remote_range_sees_its_own_writes_which_others_see_after_the_commit() 
         "no other transaction sees them yet"
     );
 
-    // Nothing is pending any more, and the commit still carries what went with the scan.
     tx.commit().await.expect("a commit");
     let after = range(&owner, b"k", b"l", false, 1000).await;
     assert_eq!(after, seen);
     close(owner, client, &base).await;
 }
 
-/// The pages of one scan read one snapshot: what the owner commits into the part of the
-/// range a client has not read yet stays out of the client's scan.
+/// The pages of one cursor read one snapshot: what the owner commits into the part of the
+/// range a client has not read yet stays out of the client's cursor.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_paged_remote_range_keeps_its_snapshot() {
+async fn a_paged_remote_cursor_keeps_its_snapshot() {
     let base = base("snapshot");
     let (owner, client) = owner_and_client(&base).await;
     write_ten_keys(&owner).await;
 
-    let mut tx = client.begin().await.expect("a transaction");
+    let tx = client.begin().await.expect("a transaction");
+    let mut cursor = tx.range(b"k", b"l").expect("a cursor");
+    cursor.set_page_size(2);
     let mut seen = Vec::new();
-    {
-        let mut scan = tx.range(b"k", b"l").page(2);
-        seen.push(scan.next().await.expect("a page").expect("an entry"));
-        let mut later = owner.begin().await.expect("a transaction");
-        later.set(b"k055", b"late").expect("a write");
-        later.delete(b"k08").expect("a delete");
-        later.commit().await.expect("a commit");
-        while let Some(entry) = scan.next().await.expect("a page") {
-            seen.push(entry);
+    let mut valid = cursor.seek_first().await.expect("a seek");
+    seen.push(String::from_utf8_lossy(cursor.key().user_key()).into_owned());
+    let mut later = owner.begin().await.expect("a transaction");
+    later.set(b"k055", b"late").expect("a write");
+    later.delete(b"k08").expect("a delete");
+    later.commit().await.expect("a commit");
+    while valid {
+        valid = cursor.next().await.expect("a move");
+        if valid {
+            seen.push(String::from_utf8_lossy(cursor.key().user_key()).into_owned());
         }
     }
-    tx.rollback();
-    assert_eq!(keys(&seen), ten_keys());
+    assert_eq!(seen, ten_keys());
     close(owner, client, &base).await;
 }
 
@@ -215,64 +209,29 @@ async fn a_history_reads_the_same_in_pages_in_the_owner_and_through_the_socket()
     tx.commit().await.expect("a commit");
 
     let range = (&b"h"[..], &b"i"[..]);
-    let all = history(&owner, range, true, None, 1000).await;
+    let tombstones = HistoryOptions::new().with_tombstones(true);
+    let all = history(&owner, range, &tombstones, 1000).await;
     assert_eq!(
         shown(&all),
         ["h1=-", "h1=3", "h1=2", "h1=1", "h2=b", "h2=a"]
     );
-    for pair in all.windows(2).filter(|pair| pair[0].key == pair[1].key) {
-        assert!(
-            pair[0].timestamp > pair[1].timestamp,
-            "newest first: {pair:?}"
-        );
+    for pair in all.windows(2).filter(|pair| pair[0].0 == pair[1].0) {
+        assert!(pair[0].1 > pair[1].1, "newest first: {pair:?}");
     }
-    let values = history(&owner, range, false, None, 1000).await;
+    let values = history(&owner, range, &HistoryOptions::new(), 1000).await;
     assert_eq!(shown(&values), ["h1=3", "h1=2", "h1=1", "h2=b", "h2=a"]);
     // From `h2=a` to `h1=3`: they and `h1=2`, which was written between them.
-    let window = Some((all[5].timestamp, all[1].timestamp));
-    let between = history(&owner, range, false, window, 1000).await;
+    let window = HistoryOptions::new().with_ts_range(all[5].1, all[1].1);
+    let between = history(&owner, range, &window, 1000).await;
     assert_eq!(shown(&between), ["h1=3", "h1=2", "h2=a"]);
 
     for page in [1, 2, 4, 1000] {
         for (who, tree) in [("owner", &owner), ("client", &client)] {
-            let read = history(tree, range, true, None, page).await;
+            let read = history(tree, range, &tombstones, page).await;
             assert_eq!(read, all, "{who}, page {page}, with tombstones");
-            let read = history(tree, range, false, window, page).await;
+            let read = history(tree, range, &window, page).await;
             assert_eq!(read, between, "{who}, page {page}, between");
         }
-    }
-    close(owner, client, &base).await;
-}
-
-/// A range whose start lies past its end holds no key, and reading it, or its history,
-/// answers nothing, in the owner and through the socket, even with writes pending, where
-/// SurrealKV itself panics.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_range_with_its_bounds_reversed_is_empty() {
-    let base = base("reversed");
-    let (owner, client) = owner_and_client(&base).await;
-    write_ten_keys(&owner).await;
-
-    for (who, tree) in [("owner", &owner), ("client", &client)] {
-        let mut tx = tree.begin().await.expect("a transaction");
-        tx.set(b"k05", b"pending").expect("a write");
-        for reverse in [false, true] {
-            let mut scan = tx.range(b"l", b"k").page(3);
-            if reverse {
-                scan = scan.reverse();
-            }
-            assert_eq!(scan.next().await.expect("a page"), None, "{who}, {reverse}");
-        }
-        let mut read = tx.history(b"l", b"k").with_tombstones();
-        assert_eq!(read.next().await.expect("a page"), None, "{who}, history");
-        assert_eq!(
-            tx.get(b"k05")
-                .await
-                .expect("the transaction still works")
-                .as_deref(),
-            Some(&b"pending"[..]),
-            "{who}"
-        );
     }
     close(owner, client, &base).await;
 }
@@ -292,16 +251,13 @@ async fn a_hard_delete_takes_the_history_with_it() {
     tx.commit().await.expect("a commit");
 
     for tree in [&owner, &client] {
-        assert!(
-            history(tree, (b"x", b"y"), false, None, 1000)
-                .await
-                .is_empty()
-        );
+        let read = history(tree, (b"x", b"y"), &HistoryOptions::new(), 1000).await;
+        assert!(read.is_empty());
     }
     close(owner, client, &base).await;
 }
 
-/// A client's history read sees the write its transaction has not sent yet, at the time
+/// A client's history sees the write its transaction has not sent yet, at the time
 /// SurrealKV gives a write that has no time until it commits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_remote_history_sees_its_own_pending_write() {
@@ -313,18 +269,106 @@ async fn a_remote_history_sees_its_own_pending_write() {
 
     let mut tx = client.begin().await.expect("a transaction");
     tx.set(b"h", b"new").expect("a write");
-    let mut versions = Vec::new();
-    {
-        let mut read = tx.history(b"h", b"i");
-        while let Some(version) = read.next().await.expect("a page") {
-            versions.push(version);
-        }
-    }
+    let versions = {
+        let mut cursor = tx.history(b"h", b"i").expect("a cursor");
+        walk(&mut cursor, false).await
+    };
     assert_eq!(shown(&versions), ["h=new", "h=old"]);
-    assert_eq!(versions[0].timestamp, u64::MAX);
+    assert_eq!(versions[0].1, u64::MAX);
     tx.rollback();
 
-    let after = history(&owner, (b"h", b"i"), false, None, 1000).await;
+    let after = history(&owner, (b"h", b"i"), &HistoryOptions::new(), 1000).await;
     assert_eq!(shown(&after), ["h=old"], "the rolled back write is gone");
+    close(owner, client, &base).await;
+}
+
+/// A range whose start lies past its end holds no key, and a cursor over it, or over its
+/// history, finds nothing, in the owner and through the socket, even with writes
+/// pending, where SurrealKV itself panics.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_range_with_its_bounds_reversed_is_empty() {
+    let base = base("reversed");
+    let (owner, client) = owner_and_client(&base).await;
+    write_ten_keys(&owner).await;
+
+    for (who, tree) in [("owner", &owner), ("client", &client)] {
+        let mut tx = tree.begin().await.expect("a transaction");
+        tx.set(b"k05", b"pending").expect("a write");
+        let mut cursor = tx.range(b"l", b"k").expect("a cursor");
+        assert!(walk(&mut cursor, false).await.is_empty(), "{who}");
+        assert!(walk(&mut cursor, true).await.is_empty(), "{who}");
+        let mut cursor = tx.history(b"l", b"k").expect("a cursor");
+        assert!(walk(&mut cursor, false).await.is_empty(), "{who}, history");
+        assert_eq!(
+            tx.get(b"k05")
+                .await
+                .expect("the transaction still works")
+                .as_deref(),
+            Some(&b"pending"[..]),
+            "{who}"
+        );
+    }
+    close(owner, client, &base).await;
+}
+
+/// A history of a tree that keeps no versions is refused when the cursor opens, as
+/// SurrealKV refuses it, in the owner and through the socket.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_history_without_versions_is_refused_as_surrealkv_refuses_it() {
+    let base = base("unversioned");
+    let plain = surrealkv::TreeBuilder::new()
+        .with_path(base.join("p"))
+        .build()
+        .expect("SurrealKV opens");
+    let expected = {
+        let tx = plain.begin().expect("a transaction");
+        let refusal = tx.history(b"a", b"z").err().expect("refused");
+        format!("{:?}", kvshare::Error::from(refusal))
+    };
+    plain.close().await.expect("SurrealKV closes");
+
+    let shared = base.join("s");
+    let builder = || {
+        kvshare::TreeBuilder::new()
+            .with_path(shared.join("db"))
+            .with_run_dir(shared.join("run"))
+    };
+    let owner = builder().build().await.expect("the owner");
+    let client = builder().build().await.expect("the client");
+    for (who, tree) in [("owner", &owner), ("client", &client)] {
+        let tx = tree.begin().await.expect("a transaction");
+        let refusal = tx.history(b"a", b"z").err().expect("refused");
+        assert_eq!(format!("{refusal:?}"), expected, "{who}");
+    }
+    close(owner, client, &shared).await;
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A cursor's moves can be awaited in a spawned task: what it holds crosses threads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cursor_moves_in_a_spawned_task() {
+    let base = base("spawned");
+    let (owner, client) = owner_and_client(&base).await;
+    write_ten_keys(&owner).await;
+
+    let mut tasks = tokio::task::JoinSet::new();
+    for tree in [owner.clone(), client.clone()] {
+        tasks.spawn(async move {
+            let tx = tree.begin().await.expect("a transaction");
+            let mut cursor = tx.range(b"k", b"l").expect("a cursor");
+            cursor.set_page_size(3);
+            let mut count = 0;
+            let mut valid = cursor.seek_first().await.expect("a seek");
+            while valid {
+                count += 1;
+                tokio::task::yield_now().await;
+                valid = cursor.next().await.expect("a move");
+            }
+            count
+        });
+    }
+    while let Some(count) = tasks.join_next().await {
+        assert_eq!(count.expect("a task ends"), 10);
+    }
     close(owner, client, &base).await;
 }

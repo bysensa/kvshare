@@ -1,19 +1,22 @@
 //! What runs on a SurrealKV transaction for a request: a client's writes applied in
-//! their order, and pages of range and history reads. The owner runs it for its clients,
-//! and the owner's own transactions run the same code.
+//! their order, and the pages of a cursor. The owner runs it for its clients, and the
+//! owner's own transactions run the same code: their cursors read pages here too.
 //!
-//! A page is a new SurrealKV read of the transaction, so the pages of one scan see the
-//! same snapshot and the same writes of the transaction. A page stops at its limit of
-//! entries or at [`PAGE_BYTES`] of keys and values, whichever comes first, but always
-//! holds one entry if there is one.
+//! A page is read by a new SurrealKV iterator on the transaction, so the pages of one
+//! cursor see the same snapshot and the same writes of the transaction. A page stops at
+//! its limit of entries or at [`PAGE_BYTES`] of keys and values, whichever comes first,
+//! but always holds one entry if there is one.
 //!
-//! A range whose start lies past its end is empty here. SurrealKV 1.4 panics on one once
-//! the transaction holds a write (it is a range of the transaction's `BTreeMap` of
-//! writes), and a client's request must not bring down the owner's task.
+//! A page names each entry by its [`Position`]: the key, and which of the key's entries
+//! it is, counted from the end the page came from. Counting needs no extra reads: a step
+//! to another key starts at 0, and a step within a key moves the count by one. A later
+//! page finds the entry again by seeking its key and stepping as many times.
 
 use surrealkv::{HistoryOptions, LSMIterator, Transaction, WriteOptions};
 
-use crate::protocol::{Entry, HistoryFilter, PAGE_BYTES, Version, Write};
+use crate::error::KvError;
+use crate::protocol::{At, Item, Nth, PAGE_BYTES, Position, Source, Write};
+use crate::types::just_past;
 
 /// Apply `writes` to `transaction` in their order, each by the SurrealKV method the
 /// client called. SurrealKV decides what a write leaves of the earlier writes of the
@@ -54,88 +57,137 @@ fn with_timestamp(timestamp: Option<u64>) -> WriteOptions {
     WriteOptions::new().with_timestamp(timestamp)
 }
 
-/// Up to `limit` entries of `[start, end)` as `transaction` sees them, in key order or,
-/// with `reverse`, backwards; and whether more follow.
-pub(crate) fn range_page(
-    transaction: &Transaction,
-    start: &[u8],
-    end: &[u8],
-    reverse: bool,
-    limit: usize,
-) -> surrealkv::Result<(Vec<Entry>, bool)> {
-    if start > end {
-        return Ok((Vec::new(), false));
-    }
-    let mut cursor = transaction.range(start, end)?;
-    let mut valid = if reverse {
-        cursor.seek_last()?
-    } else {
-        cursor.seek_first()?
-    };
-    let (mut entries, mut bytes) = (Vec::new(), 0);
-    while valid {
-        if entries.len() >= limit.max(1) || bytes >= PAGE_BYTES {
-            return Ok((entries, true));
+/// A SurrealKV iterator of `source` on `transaction`, with no limit: a cursor spends its
+/// limit itself. Opening checks what SurrealKV checks of the transaction.
+pub(crate) fn open<'t>(
+    transaction: &'t Transaction,
+    source: &Source,
+) -> surrealkv::Result<Box<dyn LSMIterator + 't>> {
+    match source {
+        Source::Range { lower, upper } => {
+            let mut options = surrealkv::ReadOptions::new();
+            options.set_iterate_lower_bound(lower.clone());
+            options.set_iterate_upper_bound(upper.clone());
+            Ok(Box::new(transaction.range_with_options(&options)?))
         }
-        let key = cursor.key().user_key().to_vec();
-        let value = cursor.value()?;
-        bytes += key.len() + value.len();
-        entries.push((key, value));
-        valid = if reverse {
-            cursor.prev()?
-        } else {
-            cursor.next()?
-        };
+        Source::History {
+            start,
+            end,
+            tombstones,
+            between,
+        } => {
+            let mut options = HistoryOptions::new().with_tombstones(*tombstones);
+            if let Some((from, to)) = *between {
+                options = options.with_ts_range(from, to);
+            }
+            Ok(Box::new(transaction.history_with_options(
+                start.as_slice(),
+                end.as_slice(),
+                &options,
+            )?))
+        }
     }
-    Ok((entries, false))
 }
 
-/// Up to `limit` versions of the keys of `[start, end)` that pass `filter`, the keys in
-/// order and the versions of a key newest first, past the first `skip` versions of
-/// `start` itself; and whether more follow.
-pub(crate) fn history_page(
+/// Up to `limit` entries of `source` on `transaction` from `at`, in the order they were
+/// read; and whether more follow that way.
+pub(crate) fn page(
     transaction: &Transaction,
-    start: &[u8],
-    end: &[u8],
-    skip: u64,
-    filter: HistoryFilter,
+    source: &Source,
+    at: At,
     limit: usize,
-) -> surrealkv::Result<(Vec<Version>, bool)> {
-    if start > end {
-        return Ok((Vec::new(), false));
-    }
-    let mut options = HistoryOptions::new().with_tombstones(filter.tombstones);
-    if let Some((from, to)) = filter.between {
-        options = options.with_ts_range(from, to);
-    }
-    let mut cursor = transaction.history_with_options(start, end, &options)?;
-    let mut valid = cursor.seek_first()?;
-    let mut skipped = 0;
-    while valid && skipped < skip && cursor.key().user_key() == start {
-        skipped += 1;
-        valid = cursor.next()?;
-    }
-    let (mut versions, mut bytes) = (Vec::new(), 0);
-    while valid {
-        if versions.len() >= limit.max(1) || bytes >= PAGE_BYTES {
-            return Ok((versions, true));
+) -> surrealkv::Result<(Vec<Item>, bool)> {
+    let mut cursor = open(transaction, source)?;
+    let forwards = at.forwards();
+    let (mut valid, mut previous) = match at {
+        At::First => (cursor.seek_first()?, None),
+        At::Last => (cursor.seek_last()?, None),
+        At::Seek(target) => (cursor.seek(&target)?, None),
+        At::After(position) => {
+            locate(&mut *cursor, &position)?;
+            (cursor.next()?, Some(position))
         }
-        let (key, timestamp, tombstone) = {
-            let at = cursor.key();
-            (at.user_key().to_vec(), at.timestamp(), at.is_tombstone())
+        At::Before(position) => {
+            locate(&mut *cursor, &position)?;
+            (cursor.prev()?, Some(position))
+        }
+    };
+    let (mut items, mut bytes) = (Vec::new(), 0);
+    while valid {
+        if items.len() >= limit.max(1) || bytes >= PAGE_BYTES {
+            return Ok((items, true));
+        }
+        let (key, timestamp) = {
+            let key = cursor.key();
+            (key.encoded().to_vec(), key.timestamp())
         };
-        let value = if tombstone {
-            None
-        } else {
-            Some(cursor.value()?)
-        };
-        bytes += key.len() + value.as_ref().map_or(0, Vec::len);
-        versions.push(Version {
+        let value = cursor.value().map_err(KvError::from);
+        let mut item = Item {
             key,
             timestamp,
+            nth: Nth::FromNewest(0),
             value,
-        });
-        valid = cursor.next()?;
+        };
+        item.nth = step(previous.as_ref(), item.user_key(), forwards);
+        bytes += item.key.len() + item.value.as_ref().map_or(0, Vec::len);
+        previous = Some(item.position());
+        items.push(item);
+        valid = if forwards {
+            cursor.next()?
+        } else {
+            cursor.prev()?
+        };
     }
-    Ok((versions, false))
+    Ok((items, false))
+}
+
+/// Which of its key's entries the entry of `key` is, reached by one step forwards or
+/// backwards from `previous`, or by a seek when there is no `previous`.
+fn step(previous: Option<&Position>, key: &[u8], forwards: bool) -> Nth {
+    match previous {
+        Some(previous) if previous.key == key => match (previous.nth, forwards) {
+            (Nth::FromNewest(n), true) => Nth::FromNewest(n + 1),
+            (Nth::FromNewest(n), false) => Nth::FromNewest(n.saturating_sub(1)),
+            (Nth::FromOldest(n), true) => Nth::FromOldest(n.saturating_sub(1)),
+            (Nth::FromOldest(n), false) => Nth::FromOldest(n + 1),
+        },
+        _ if forwards => Nth::FromNewest(0),
+        _ => Nth::FromOldest(0),
+    }
+}
+
+/// Put `cursor` on the entry at `position`. A cursor keeps its transaction borrowed, so
+/// the transaction has not changed since the page that named the entry; an entry that
+/// is not there is a client out of step with its owner.
+fn locate(cursor: &mut dyn LSMIterator, position: &Position) -> surrealkv::Result<()> {
+    let (mut valid, steps, forwards) = match position.nth {
+        Nth::FromNewest(n) => (cursor.seek(&position.key)?, n, true),
+        // The key's oldest entry is the one before the next key's newest, or the last of
+        // all when no key follows.
+        Nth::FromOldest(n) => {
+            let valid = if cursor.seek(&just_past(&position.key))? {
+                cursor.prev()?
+            } else {
+                cursor.seek_last()?
+            };
+            (valid, n, false)
+        }
+    };
+    for _ in 0..steps {
+        if !valid {
+            break;
+        }
+        valid = if forwards {
+            cursor.next()?
+        } else {
+            cursor.prev()?
+        };
+    }
+    if valid && cursor.key().user_key() == position.key.as_slice() {
+        Ok(())
+    } else {
+        Err(surrealkv::Error::InvalidArgument(format!(
+            "a cursor's entry {position:?} is not in its transaction"
+        )))
+    }
 }

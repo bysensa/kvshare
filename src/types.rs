@@ -2,7 +2,7 @@
 //! SurrealKV because SurrealKV keeps it private.
 
 use serde::{Deserialize, Serialize};
-use surrealkv::{Durability, Mode, Options};
+use surrealkv::{Durability, IntoBytes, Mode, Options};
 
 use crate::error::{Error, Result};
 
@@ -89,6 +89,104 @@ impl ReadOptions {
     pub fn set_iterate_upper_bound(&mut self, bound: Option<Vec<u8>>) {
         self.upper_bound = bound;
     }
+
+    /// The bounds of `range`: `..`, `a..b`, `a..=b`, `a..`, `..b` or `..=b`.
+    pub fn from_range<R: KeyRange>(range: R) -> Self {
+        ReadOptions {
+            lower_bound: range.start_bound_bytes(),
+            upper_bound: range.end_bound_bytes(),
+        }
+    }
+}
+
+/// A range of keys as the bounds of an iteration, as SurrealKV's `KeyRange`: the lower
+/// bound included, the upper one excluded, `None` for no bound. An inclusive end becomes
+/// the exclusive bound just past it, the key with a zero byte appended.
+///
+/// kvshare repeats the trait because SurrealKV declares it in a private module.
+pub trait KeyRange {
+    /// The lower bound, included; `None` if there is none.
+    fn start_bound_bytes(&self) -> Option<Vec<u8>>;
+    /// The upper bound, excluded; `None` if there is none.
+    fn end_bound_bytes(&self) -> Option<Vec<u8>>;
+}
+
+impl KeyRange for std::ops::RangeFull {
+    fn start_bound_bytes(&self) -> Option<Vec<u8>> {
+        None
+    }
+
+    fn end_bound_bytes(&self) -> Option<Vec<u8>> {
+        None
+    }
+}
+
+impl<K: IntoBytes> KeyRange for std::ops::Range<K> {
+    fn start_bound_bytes(&self) -> Option<Vec<u8>> {
+        Some(self.start.as_slice().to_vec())
+    }
+
+    fn end_bound_bytes(&self) -> Option<Vec<u8>> {
+        Some(self.end.as_slice().to_vec())
+    }
+}
+
+impl<K: IntoBytes> KeyRange for std::ops::RangeInclusive<K> {
+    fn start_bound_bytes(&self) -> Option<Vec<u8>> {
+        Some(self.start().as_slice().to_vec())
+    }
+
+    fn end_bound_bytes(&self) -> Option<Vec<u8>> {
+        Some(just_past(self.end().as_slice()))
+    }
+}
+
+impl<K: IntoBytes> KeyRange for std::ops::RangeFrom<K> {
+    fn start_bound_bytes(&self) -> Option<Vec<u8>> {
+        Some(self.start.as_slice().to_vec())
+    }
+
+    fn end_bound_bytes(&self) -> Option<Vec<u8>> {
+        None
+    }
+}
+
+impl<K: IntoBytes> KeyRange for std::ops::RangeTo<K> {
+    fn start_bound_bytes(&self) -> Option<Vec<u8>> {
+        None
+    }
+
+    fn end_bound_bytes(&self) -> Option<Vec<u8>> {
+        Some(self.end.as_slice().to_vec())
+    }
+}
+
+impl<K: IntoBytes> KeyRange for std::ops::RangeToInclusive<K> {
+    fn start_bound_bytes(&self) -> Option<Vec<u8>> {
+        None
+    }
+
+    fn end_bound_bytes(&self) -> Option<Vec<u8>> {
+        Some(just_past(self.end.as_slice()))
+    }
+}
+
+impl<R: KeyRange> KeyRange for &R {
+    fn start_bound_bytes(&self) -> Option<Vec<u8>> {
+        (*self).start_bound_bytes()
+    }
+
+    fn end_bound_bytes(&self) -> Option<Vec<u8>> {
+        (*self).end_bound_bytes()
+    }
+}
+
+/// The smallest key greater than `key`.
+pub(crate) fn just_past(key: &[u8]) -> Vec<u8> {
+    let mut past = Vec::with_capacity(key.len() + 1);
+    past.extend_from_slice(key);
+    past.push(0);
+    past
 }
 
 impl From<&ReadOptions> for surrealkv::ReadOptions {

@@ -14,7 +14,7 @@ use tokio::task::{JoinHandle, JoinSet};
 
 use crate::endpoint::Endpoint;
 use crate::error::KvError;
-use crate::exec::{apply, history_page, range_page};
+use crate::exec::{apply, page};
 use crate::protocol::{
     Answer, MAX_TRANSACTIONS, Request, RequestId, TxId, VERSION, Welcome, Write, read_frame,
     write_frame,
@@ -174,30 +174,15 @@ async fn serve(stream: UnixStream, tree: Arc<Tree>, welcome: Arc<Welcome>) {
             } => table.on(tx, writes, |transaction| {
                 Ok(Answer::GotMany(transaction.get_many_at(&keys, timestamp)?))
             }),
-            Request::Range {
+            Request::Cursor {
                 tx,
                 writes,
-                start,
-                end,
-                reverse,
+                source,
+                at,
                 limit,
             } => table.on(tx, writes, |transaction| {
-                let (entries, more) =
-                    range_page(transaction, &start, &end, reverse, limit as usize)?;
-                Ok(Answer::Ranged { entries, more })
-            }),
-            Request::History {
-                tx,
-                writes,
-                start,
-                end,
-                skip,
-                filter,
-                limit,
-            } => table.on(tx, writes, |transaction| {
-                let (versions, more) =
-                    history_page(transaction, &start, &end, skip, filter, limit as usize)?;
-                Ok(Answer::Versions { versions, more })
+                let (items, more) = page(transaction, &source.narrowed(), at, limit as usize)?;
+                Ok(Answer::Page { items, more })
             }),
             Request::Commit {
                 tx,

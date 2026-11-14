@@ -1,29 +1,31 @@
 //! The same operations on SurrealKV itself, on the owner's tree and through a client of
 //! another owner: every answer, a value or an error, is the same.
 //!
-//! Each scenario writes down what each operation answered, and the three records must
-//! match line for line. Times are written down only when the scenario chose them; a
-//! commit's own time differs from one database to another.
+//! Each scenario writes down what each operation answered, and the records must match
+//! line for line. Times are written down only when the scenario chose them; a commit's
+//! own time differs from one database to another. The owner and the client run each
+//! scenario with cursors that read pages of several sizes.
 
 mod common;
 
 use common::{base, builder, close, owner_and_client};
-use kvshare::{Durability, Error, Mode, ReadOptions, WriteOptions};
-use surrealkv::{HistoryOptions, LSMIterator};
+use kvshare::{Durability, Error, HistoryOptions, Mode, ReadOptions, WriteOptions};
+use surrealkv::LSMIterator;
 
-/// A database under test.
+/// A database under test, and for kvshare the size of its cursors' pages.
 enum Db<'a> {
     Plain(&'a surrealkv::Tree),
-    Shared(&'a kvshare::Tree),
+    Shared(&'a kvshare::Tree, usize),
 }
 
 impl Db<'_> {
     async fn begin(&self, mode: Mode) -> Tx {
         match self {
             Db::Plain(tree) => Tx::Plain(tree.begin_with_mode(mode).expect("a transaction")),
-            Db::Shared(tree) => {
-                Tx::Shared(tree.begin_with_mode(mode).await.expect("a transaction"))
-            }
+            Db::Shared(tree, page) => Tx::Shared(
+                tree.begin_with_mode(mode).await.expect("a transaction"),
+                *page,
+            ),
         }
     }
 }
@@ -31,7 +33,7 @@ impl Db<'_> {
 /// A transaction under test.
 enum Tx {
     Plain(surrealkv::Transaction),
-    Shared(kvshare::Transaction),
+    Shared(kvshare::Transaction, usize),
 }
 
 /// What an answer looks like in the record.
@@ -54,6 +56,12 @@ impl Shown for usize {
 impl Shown for Option<usize> {
     fn shown(self) -> String {
         format!("{self:?}")
+    }
+}
+
+impl Shown for Vec<u8> {
+    fn shown(self) -> String {
+        lossy(&self)
     }
 }
 
@@ -107,7 +115,7 @@ macro_rules! write {
     ($tx:expr, $method:ident($($arg:expr),*)) => {
         match $tx {
             Tx::Plain(t) => said(plain(t.$method($($arg),*))),
-            Tx::Shared(t) => said(t.$method($($arg),*)),
+            Tx::Shared(t, _) => said(t.$method($($arg),*)),
         }
     };
 }
@@ -117,13 +125,123 @@ macro_rules! read {
     ($tx:expr, $method:ident($($arg:expr),*)) => {
         match $tx {
             Tx::Plain(t) => said(plain(t.$method($($arg),*))),
-            Tx::Shared(t) => said(t.$method($($arg),*).await),
+            Tx::Shared(t, _) => said(t.$method($($arg),*).await),
         }
     };
 }
 
 fn timestamp(at: Option<u64>) -> WriteOptions {
     WriteOptions::new().with_timestamp(at)
+}
+
+/// Which cursor a walk opens.
+enum Open<'a> {
+    Iter,
+    Scan(Bounds<'a>),
+    Range(&'a [u8], &'a [u8]),
+    RangeWithOptions(Option<&'a [u8]>, Option<&'a [u8]>),
+    History(&'a [u8], &'a [u8], HistoryOptions),
+}
+
+/// The kinds of range `scan` takes.
+#[derive(Clone, Copy)]
+enum Bounds<'a> {
+    Full,
+    HalfOpen(&'a [u8], &'a [u8]),
+    Inclusive(&'a [u8], &'a [u8]),
+    From(&'a [u8]),
+    To(&'a [u8]),
+    ToInclusive(&'a [u8]),
+}
+
+/// A move of a cursor.
+#[derive(Clone, Copy, Debug)]
+enum Move<'a> {
+    First,
+    Last,
+    Seek(&'a [u8]),
+    Next,
+    Prev,
+}
+
+/// To the first entry and `steps` entries on, then to the last and `steps` back.
+fn there_and_back(steps: usize) -> Vec<Move<'static>> {
+    let mut moves = vec![Move::First];
+    moves.extend(std::iter::repeat_n(Move::Next, steps));
+    moves.push(Move::Last);
+    moves.extend(std::iter::repeat_n(Move::Prev, steps));
+    moves
+}
+
+fn open_plain<'t>(
+    t: &'t surrealkv::Transaction,
+    open: &Open<'_>,
+) -> surrealkv::Result<Box<dyn LSMIterator + 't>> {
+    Ok(match open {
+        Open::Iter => Box::new(t.iter()?),
+        Open::Scan(bounds) => match *bounds {
+            Bounds::Full => Box::new(t.scan(..)?),
+            Bounds::HalfOpen(a, z) => Box::new(t.scan(a..z)?),
+            Bounds::Inclusive(a, z) => Box::new(t.scan(a..=z)?),
+            Bounds::From(a) => Box::new(t.scan(a..)?),
+            Bounds::To(z) => Box::new(t.scan(..z)?),
+            Bounds::ToInclusive(z) => Box::new(t.scan(..=z)?),
+        },
+        Open::Range(a, z) => Box::new(t.range(*a, *z)?),
+        Open::RangeWithOptions(lower, upper) => {
+            let mut options = surrealkv::ReadOptions::new();
+            options.set_iterate_lower_bound(lower.map(<[u8]>::to_vec));
+            options.set_iterate_upper_bound(upper.map(<[u8]>::to_vec));
+            Box::new(t.range_with_options(&options)?)
+        }
+        Open::History(a, z, options) => Box::new(t.history_with_options(*a, *z, options)?),
+    })
+}
+
+fn open_shared<'t>(
+    t: &'t kvshare::Transaction,
+    open: &Open<'_>,
+) -> kvshare::Result<kvshare::Cursor<'t>> {
+    match open {
+        Open::Iter => t.iter(),
+        Open::Scan(bounds) => match *bounds {
+            Bounds::Full => t.scan(..),
+            Bounds::HalfOpen(a, z) => t.scan(a..z),
+            Bounds::Inclusive(a, z) => t.scan(a..=z),
+            Bounds::From(a) => t.scan(a..),
+            Bounds::To(z) => t.scan(..z),
+            Bounds::ToInclusive(z) => t.scan(..=z),
+        },
+        Open::Range(a, z) => t.range(*a, *z),
+        Open::RangeWithOptions(lower, upper) => {
+            let mut options = ReadOptions::new();
+            options.set_iterate_lower_bound(lower.map(<[u8]>::to_vec));
+            options.set_iterate_upper_bound(upper.map(<[u8]>::to_vec));
+            t.range_with_options(&options)
+        }
+        Open::History(a, z, options) => t.history_with_options(*a, *z, options),
+    }
+}
+
+/// What a move answered and where the cursor stands after it: the key, the time, the
+/// kind of the write and the value.
+fn landed(
+    answer: Result<bool, Error>,
+    valid: bool,
+    entry: impl FnOnce() -> (String, u64, String, Result<Vec<u8>, Error>),
+) -> String {
+    match answer {
+        Err(error) => format!("err {error:?}"),
+        Ok(false) => format!("ok false valid={valid}"),
+        Ok(true) => {
+            let (key, at, kind, value) = entry();
+            format!(
+                "ok true valid={valid} {key}@{} {kind} {}",
+                stamp(at),
+                said(value)
+            )
+        }
+    }
 }
 
 impl Tx {
@@ -174,14 +292,14 @@ impl Tx {
     fn rollback(&mut self) {
         match self {
             Tx::Plain(t) => t.rollback(),
-            Tx::Shared(t) => t.rollback(),
+            Tx::Shared(t, _) => t.rollback(),
         }
     }
 
     async fn commit(&mut self) -> String {
         match self {
             Tx::Plain(t) => said(plain(t.commit().await)),
-            Tx::Shared(t) => said(t.commit().await),
+            Tx::Shared(t, _) => said(t.commit().await),
         }
     }
 
@@ -192,14 +310,14 @@ impl Tx {
     async fn get_async(&mut self, key: &[u8]) -> String {
         match self {
             Tx::Plain(t) => said(plain(t.get_async(key).await)),
-            Tx::Shared(t) => said(t.get_async(key).await),
+            Tx::Shared(t, _) => said(t.get_async(key).await),
         }
     }
 
     fn set_durability(&mut self, durability: Durability) {
         match self {
             Tx::Plain(t) => t.set_durability(durability),
-            Tx::Shared(t) => t.set_durability(durability),
+            Tx::Shared(t, _) => t.set_durability(durability),
         }
     }
 
@@ -207,7 +325,7 @@ impl Tx {
     fn with_durability(self, durability: Durability) -> Self {
         match self {
             Tx::Plain(t) => Tx::Plain(t.with_durability(durability)),
-            Tx::Shared(t) => Tx::Shared(t.with_durability(durability)),
+            Tx::Shared(t, page) => Tx::Shared(t.with_durability(durability), page),
         }
     }
 
@@ -233,7 +351,7 @@ impl Tx {
             Tx::Plain(t) => said(plain(
                 t.get_with_options(key, &surrealkv::ReadOptions::from(&options)),
             )),
-            Tx::Shared(t) => said(t.get_with_options(key, &options).await),
+            Tx::Shared(t, _) => said(t.get_with_options(key, &options).await),
         }
     }
 
@@ -258,119 +376,115 @@ impl Tx {
         let answer = match (self, at) {
             (Tx::Plain(t), None) => plain(t.get_many_with(keys, note)),
             (Tx::Plain(t), Some(at)) => plain(t.get_many_at_with(keys, at, note)),
-            (Tx::Shared(t), None) => t.get_many_with(keys, note).await,
-            (Tx::Shared(t), Some(at)) => t.get_many_at_with(keys, at, note).await,
+            (Tx::Shared(t, _), None) => t.get_many_with(keys, note).await,
+            (Tx::Shared(t, _), Some(at)) => t.get_many_at_with(keys, at, note).await,
         };
         said(answer.map(|()| seen))
     }
 
-    /// The entries of `[start, end)`, in key order or backwards; through kvshare, in
-    /// pages of two.
+    /// Open the cursor `open` and make `moves`, writing down what each answered.
+    async fn walk(&mut self, open: &Open<'_>, moves: &[Move<'_>]) -> Vec<String> {
+        match self {
+            Tx::Plain(t) => {
+                let mut cursor = match open_plain(t, open) {
+                    Ok(cursor) => cursor,
+                    Err(error) => return vec![format!("open: err {:?}", Error::from(error))],
+                };
+                let mut log = Vec::new();
+                for step in moves {
+                    let answer = match *step {
+                        Move::First => cursor.seek_first(),
+                        Move::Last => cursor.seek_last(),
+                        Move::Seek(target) => cursor.seek(target),
+                        Move::Next => cursor.next(),
+                        Move::Prev => cursor.prev(),
+                    };
+                    let line = landed(plain(answer), cursor.valid(), || {
+                        let key = cursor.key();
+                        (
+                            lossy(key.user_key()),
+                            key.timestamp(),
+                            format!("{:?}", key.kind()),
+                            plain(cursor.value()),
+                        )
+                    });
+                    log.push(format!("{step:?}: {line}"));
+                }
+                log
+            }
+            Tx::Shared(t, page) => {
+                let mut cursor = match open_shared(t, open) {
+                    Ok(cursor) => cursor,
+                    Err(error) => return vec![format!("open: err {error:?}")],
+                };
+                cursor.set_page_size(*page);
+                let mut log = Vec::new();
+                for step in moves {
+                    let answer = match *step {
+                        Move::First => cursor.seek_first().await,
+                        Move::Last => cursor.seek_last().await,
+                        Move::Seek(target) => cursor.seek(target).await,
+                        Move::Next => cursor.next().await,
+                        Move::Prev => cursor.prev().await,
+                    };
+                    let line = landed(answer, cursor.valid(), || {
+                        let key = cursor.key();
+                        (
+                            lossy(key.user_key()),
+                            key.timestamp(),
+                            format!("{:?}", key.kind()),
+                            cursor.value(),
+                        )
+                    });
+                    log.push(format!("{step:?}: {line}"));
+                }
+                log
+            }
+        }
+    }
+
+    /// Every entry of `[start, end)`, from the first forwards or from the last backwards,
+    /// each as `key=value`.
     async fn range(&mut self, start: &[u8], end: &[u8], reverse: bool) -> String {
-        let answer = match self {
-            Tx::Plain(t) => plain(plain_range(t, start, end, reverse)),
-            Tx::Shared(t) => {
-                let mut scan = t.range(start, end).page(2);
-                if reverse {
-                    scan = scan.reverse();
-                }
-                let mut seen = Vec::new();
-                loop {
-                    match scan.next().await {
-                        Ok(Some((key, value))) => {
-                            seen.push(format!("{}={}", lossy(&key), lossy(&value)));
-                        }
-                        Ok(None) => break Ok(seen),
-                        Err(error) => break Err(error),
-                    }
-                }
-            }
+        let (first, step) = if reverse {
+            (Move::Last, Move::Prev)
+        } else {
+            (Move::First, Move::Next)
         };
-        said(answer)
+        self.entries(&Open::Range(start, end), first, step).await
     }
 
-    /// Every version of the keys of `[start, end)`, tombstones too; through kvshare, in
-    /// pages of two.
+    /// Every version of the keys of `[start, end)`, tombstones too, each as
+    /// `key@time=value`.
     async fn history(&mut self, start: &[u8], end: &[u8]) -> String {
-        let answer = match self {
-            Tx::Plain(t) => plain(plain_history(t, start, end)),
-            Tx::Shared(t) => {
-                let mut read = t.history(start, end).with_tombstones().page(2);
-                let mut seen = Vec::new();
-                loop {
-                    match read.next().await {
-                        Ok(Some(version)) => seen.push(format!(
-                            "{}@{}={}",
-                            lossy(&version.key),
-                            stamp(version.timestamp),
-                            version.value.as_deref().map_or("-".into(), lossy)
-                        )),
-                        Ok(None) => break Ok(seen),
-                        Err(error) => break Err(error),
-                    }
-                }
+        let options = HistoryOptions::new().with_tombstones(true);
+        self.entries(&Open::History(start, end, options), Move::First, Move::Next)
+            .await
+    }
+
+    /// Every entry from `first` on, by `step`.
+    async fn entries(&mut self, open: &Open<'_>, first: Move<'_>, step: Move<'_>) -> String {
+        let mut moves = vec![first];
+        moves.extend(std::iter::repeat_n(step, 64));
+        let mut seen = Vec::new();
+        for line in self.walk(open, &moves).await {
+            if let Some(entry) = line.split(" valid=true ").nth(1) {
+                seen.push(entry.to_string());
+            } else if line.contains("err ") {
+                return line;
             }
-        };
-        said(answer)
+        }
+        format!("ok {}", seen.join(" | "))
     }
 }
 
-fn plain_range(
-    t: &surrealkv::Transaction,
-    start: &[u8],
-    end: &[u8],
-    reverse: bool,
-) -> surrealkv::Result<Vec<String>> {
-    let mut cursor = t.range(start, end)?;
-    let mut valid = if reverse {
-        cursor.seek_last()?
-    } else {
-        cursor.seek_first()?
-    };
-    let mut seen = Vec::new();
-    while valid {
-        let key = lossy(cursor.key().user_key());
-        seen.push(format!("{key}={}", lossy(&cursor.value()?)));
-        valid = if reverse {
-            cursor.prev()?
-        } else {
-            cursor.next()?
-        };
-    }
-    Ok(seen)
-}
-
-fn plain_history(
-    t: &surrealkv::Transaction,
-    start: &[u8],
-    end: &[u8],
-) -> surrealkv::Result<Vec<String>> {
-    let options = HistoryOptions::new().with_tombstones(true);
-    let mut cursor = t.history_with_options(start, end, &options)?;
-    let mut valid = cursor.seek_first()?;
-    let mut seen = Vec::new();
-    while valid {
-        let (key, at, tombstone) = {
-            let at = cursor.key();
-            (lossy(at.user_key()), at.timestamp(), at.is_tombstone())
-        };
-        let value = if tombstone {
-            "-".into()
-        } else {
-            lossy(&cursor.value()?)
-        };
-        seen.push(format!("{key}@{}={value}", stamp(at)));
-        valid = cursor.next()?;
-    }
-    Ok(seen)
-}
-
-/// Run `scenario` on SurrealKV itself, on a tree that owns its database, and on a client
-/// of a tree that owns another; the three records must be the same.
+/// Run `scenario` on SurrealKV itself, then, for each size of page, on a tree that owns
+/// its database and on a client of a tree that owns another; every record must be
+/// SurrealKV's.
 ///
 /// The directories have short names: a socket path must fit in 103 bytes, and the
 /// temporary directory of macOS takes half of them.
-async fn compare(name: &str, scenario: impl AsyncFn(&Db<'_>) -> Vec<String>) {
+async fn compare(name: &str, pages: &[usize], scenario: impl AsyncFn(&Db<'_>) -> Vec<String>) {
     let base = base(&format!("d-{name}"));
 
     let tree = surrealkv::TreeBuilder::new()
@@ -382,26 +496,35 @@ async fn compare(name: &str, scenario: impl AsyncFn(&Db<'_>) -> Vec<String>) {
     tree.close().await.expect("SurrealKV closes");
     eprintln!("{name}, as SurrealKV answers:\n  {}", expected.join("\n  "));
 
-    let alone = base.join("o");
-    let owner = builder(&alone).build().await.expect("the owner");
-    let local = scenario(&Db::Shared(&owner)).await;
-    owner.close().await.expect("the owner closes");
+    for (n, &page) in pages.iter().enumerate() {
+        let alone = base.join(format!("o{n}"));
+        let owner = builder(&alone).build().await.expect("the owner");
+        let local = scenario(&Db::Shared(&owner, page)).await;
+        owner.close().await.expect("the owner closes");
 
-    let shared = base.join("c");
-    let (owner, client) = owner_and_client(&shared).await;
-    let remote = scenario(&Db::Shared(&client)).await;
-    close(owner, client, &shared).await;
+        let shared = base.join(format!("c{n}"));
+        let (owner, client) = owner_and_client(&shared).await;
+        let remote = scenario(&Db::Shared(&client, page)).await;
+        close(owner, client, &shared).await;
 
-    for (line, expected) in expected.iter().enumerate() {
-        assert_eq!(local.get(line), Some(expected), "{name}, the owner's tree");
-        assert_eq!(
-            remote.get(line),
-            Some(expected),
-            "{name}, through the socket"
-        );
+        for (record, who) in [
+            (&local, "the owner's tree"),
+            (&remote, "through the socket"),
+        ] {
+            for (line, expected) in expected.iter().enumerate() {
+                assert_eq!(
+                    record.get(line),
+                    Some(expected),
+                    "{name}, {who}, pages of {page}, line {line}"
+                );
+            }
+            assert_eq!(
+                record.len(),
+                expected.len(),
+                "{name}, {who}, pages of {page}"
+            );
+        }
     }
-    assert_eq!(local.len(), expected.len(), "{name}, the owner's tree");
-    assert_eq!(remote.len(), expected.len(), "{name}, through the socket");
     let _ = std::fs::remove_dir_all(&base);
 }
 
@@ -452,6 +575,14 @@ async fn refusals(db: &Db<'_>) -> Vec<String> {
         rw.delete_range(b"b", b"b")
     ));
     log.push(format!("get after commit: {}", rw.get(b"k").await));
+    log.push(format!(
+        "range after commit: {}",
+        rw.range(b"a", b"z", false).await
+    ));
+    log.push(format!(
+        "history after commit: {}",
+        rw.history(b"a", b"z").await
+    ));
     log.push(format!("commit again: {}", rw.commit().await));
 
     let mut rolled = db.begin(Mode::ReadWrite).await;
@@ -466,6 +597,7 @@ async fn refusals(db: &Db<'_>) -> Vec<String> {
     log.push(format!("wo get: {}", wo.get(b"w").await));
     log.push(format!("wo get many: {}", wo.get_many(&[b"w", b"k"]).await));
     log.push(format!("wo range: {}", wo.range(b"a", b"z", false).await));
+    log.push(format!("wo history: {}", wo.history(b"a", b"z").await));
     log.push(format!("wo commit: {}", wo.commit().await));
 
     let mut check = db.begin(Mode::ReadOnly).await;
@@ -704,27 +836,280 @@ async fn conflicts(db: &Db<'_>) -> Vec<String> {
     log
 }
 
+/// A walk: its name, the cursor it opens and the moves it makes.
+type Walk<'a> = (&'a str, Open<'a>, Vec<Move<'a>>);
+
+/// Write down each walk of `walks` on `tx`, its name before each line.
+async fn walks(log: &mut Vec<String>, tx: &mut Tx, walks: Vec<Walk<'_>>) {
+    for (name, open, moves) in walks {
+        for line in tx.walk(&open, &moves).await {
+            log.push(format!("{name} {line}"));
+        }
+    }
+}
+
+/// Cursors over ranges, with the transaction's own writes: the moves one by one, past
+/// either end, back again, a change of direction, seeks inside and outside the bounds,
+/// and every kind of range `scan` takes. Not a range whose start lies past its end:
+/// SurrealKV panics on it (`tests/scan.rs` covers what kvshare does).
+async fn moves(db: &Db<'_>) -> Vec<String> {
+    use Move::{First, Last, Next, Prev, Seek};
+    let mut log = Vec::new();
+    let mut seed = db.begin(Mode::ReadWrite).await;
+    for key in ["a", "b", "c", "d", "e", "f", "g", "h"] {
+        log.push(seed.set(key.as_bytes(), key.to_uppercase().as_bytes()));
+    }
+    log.push(seed.commit().await);
+
+    let mut tx = db.begin(Mode::ReadWrite).await;
+    log.push(tx.set(b"c", b"C2"));
+    log.push(tx.delete(b"e"));
+    log.push(tx.set(b"i", b"I"));
+    log.push(tx.soft_delete(b"g"));
+    log.push(tx.set(b"bb", b"BB"));
+    let range = || Open::Range(b"b", b"h");
+    walks(
+        &mut log,
+        &mut tx,
+        vec![
+            (
+                "steps",
+                range(),
+                vec![
+                    Next, Next, Next, Prev, Prev, Prev, Next, First, Last, Next, Prev, Last, Prev,
+                    Prev, Prev, Next, Next, Next, Next, Next, Next,
+                ],
+            ),
+            ("prev first", range(), vec![Prev, Prev, Next, Next]),
+            (
+                "seeks",
+                range(),
+                vec![
+                    Seek(b"d"),
+                    Prev,
+                    Seek(b"cc"),
+                    Next,
+                    Seek(b"a"),
+                    Prev,
+                    Seek(b"z"),
+                    Prev,
+                    Next,
+                    Seek(b"e"),
+                    Prev,
+                    Next,
+                    Seek(b"h"),
+                    Seek(b"g"),
+                ],
+            ),
+            ("iter", Open::Iter, there_and_back(10)),
+            ("scan ..", Open::Scan(Bounds::Full), there_and_back(10)),
+            (
+                "scan b..d",
+                Open::Scan(Bounds::HalfOpen(b"b", b"d")),
+                there_and_back(4),
+            ),
+            (
+                "scan b..=d",
+                Open::Scan(Bounds::Inclusive(b"b", b"d")),
+                there_and_back(5),
+            ),
+            (
+                "scan c..",
+                Open::Scan(Bounds::From(b"c")),
+                there_and_back(8),
+            ),
+            ("scan ..c", Open::Scan(Bounds::To(b"c")), there_and_back(4)),
+            (
+                "scan ..=c",
+                Open::Scan(Bounds::ToInclusive(b"c")),
+                there_and_back(5),
+            ),
+            (
+                "from c",
+                Open::RangeWithOptions(Some(b"c"), None),
+                there_and_back(8),
+            ),
+            (
+                "to d",
+                Open::RangeWithOptions(None, Some(b"d")),
+                there_and_back(5),
+            ),
+            ("one key wide", Open::Range(b"c", b"c"), vec![First, Last]),
+        ],
+    )
+    .await;
+
+    let mut wo = db.begin(Mode::WriteOnly).await;
+    walks(&mut log, &mut wo, vec![("wo", Open::Iter, vec![First])]).await;
+    let mut done = db.begin(Mode::ReadWrite).await;
+    log.push(done.commit().await);
+    walks(
+        &mut log,
+        &mut done,
+        vec![("closed", Open::Iter, vec![First])],
+    )
+    .await;
+    log
+}
+
+/// A version a scenario writes: the key, the value or `None` for a tombstone, and the
+/// time.
+type Written = (&'static [u8], Option<&'static [u8]>, u64);
+
+/// Cursors over histories with versions written at chosen times, with the
+/// transaction's own writes: tombstones or not, a window of time, a limit spent across a
+/// change of direction and renewed by a seek, and moves within a key's versions.
+async fn history(db: &Db<'_>) -> Vec<String> {
+    use Move::{First, Last, Next, Prev, Seek};
+    let mut log = Vec::new();
+    let versions: [Written; 11] = [
+        (b"a", Some(b"a1"), 100),
+        (b"a", Some(b"a2"), 200),
+        (b"a", None, 300),
+        (b"b", Some(b"b1"), 150),
+        (b"c", Some(b"c1"), 120),
+        (b"c", Some(b"c2"), 220),
+        (b"c", Some(b"c3"), 320),
+        (b"d", Some(b"d1"), 130),
+        (b"d", Some(b"d2"), 230),
+        (b"e", Some(b"e1"), 140),
+        (b"f", Some(b"f1"), 160),
+    ];
+    for (key, value, at) in versions {
+        let mut tx = db.begin(Mode::ReadWrite).await;
+        log.push(match value {
+            Some(value) => tx.set_at(key, value, at),
+            None => tx.soft_delete_with_options(key, Some(at)),
+        });
+        log.push(tx.commit().await);
+    }
+
+    let mut tx = db.begin(Mode::ReadWrite).await;
+    log.push(tx.set(b"c", b"c-pending"));
+    log.push(tx.set_at(b"d", b"d4", 400));
+    log.push(tx.soft_delete(b"e"));
+    log.push(tx.delete(b"f"));
+    let tombstones = || HistoryOptions::new().with_tombstones(true);
+    let all = || Open::History(b"a", b"z", tombstones());
+    let limited = |limit| Open::History(b"a", b"z", tombstones().with_limit(limit));
+    walks(
+        &mut log,
+        &mut tx,
+        vec![
+            ("all", all(), there_and_back(16)),
+            (
+                "values",
+                Open::History(b"a", b"z", HistoryOptions::new()),
+                there_and_back(16),
+            ),
+            (
+                "window",
+                Open::History(b"a", b"z", tombstones().with_ts_range(130, 230)),
+                there_and_back(10),
+            ),
+            (
+                "within keys",
+                all(),
+                vec![
+                    First,
+                    Next,
+                    Next,
+                    Next,
+                    Prev,
+                    Prev,
+                    Next,
+                    Seek(b"c"),
+                    Prev,
+                    Prev,
+                    Next,
+                    Next,
+                    Next,
+                    Seek(b"cc"),
+                    Prev,
+                    Seek(b"z"),
+                    Prev,
+                    Last,
+                    Prev,
+                    Prev,
+                    Prev,
+                    Next,
+                ],
+            ),
+            (
+                "limit 3",
+                limited(3),
+                vec![
+                    First,
+                    Next,
+                    Next,
+                    Next,
+                    Prev,
+                    First,
+                    Next,
+                    Prev,
+                    Prev,
+                    Prev,
+                    Last,
+                    Prev,
+                    Prev,
+                    Prev,
+                    Seek(b"c"),
+                    Next,
+                    Next,
+                    Next,
+                ],
+            ),
+            ("limit 0", limited(0), vec![First, Last, Next]),
+            (
+                "limit 1",
+                limited(1),
+                vec![Next, Next, Prev, Seek(b"b"), Prev],
+            ),
+            (
+                "narrow",
+                Open::History(b"c", b"d", tombstones()),
+                there_and_back(6),
+            ),
+        ],
+    )
+    .await;
+
+    let mut wo = db.begin(Mode::WriteOnly).await;
+    walks(&mut log, &mut wo, vec![("wo", all(), vec![First])]).await;
+    log
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn refusals_are_the_same() {
-    compare("refusals", refusals).await;
+    compare("refusals", &[2], refusals).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn savepoints_are_the_same() {
-    compare("savepoints", savepoints).await;
+    compare("savepoints", &[2], savepoints).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn writes_are_the_same() {
-    compare("writes", writes).await;
+    compare("writes", &[2], writes).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reads_are_the_same() {
-    compare("reads", reads).await;
+    compare("reads", &[2], reads).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn conflicts_are_the_same() {
-    compare("conflicts", conflicts).await;
+    compare("conflicts", &[2], conflicts).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cursor_moves_are_the_same() {
+    compare("moves", &[1, 2, 256], moves).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn history_cursors_are_the_same() {
+    compare("history", &[1, 2, 256], history).await;
 }

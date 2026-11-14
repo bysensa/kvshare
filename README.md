@@ -25,6 +25,14 @@ async fn example() -> kvshare::Result<()> {
     tx.commit().await?;
     let tx = tree.begin().await?;
     assert_eq!(tx.get(b"key").await?.as_deref(), Some(&b"value"[..]));
+    // Cursors move as SurrealKV's iterators do, awaited.
+    let mut cursor = tx.scan(b"a".as_slice()..)?;
+    let mut valid = cursor.seek_first().await?;
+    while valid {
+        println!("{:?} = {:?}", cursor.key().user_key(), cursor.value()?);
+        valid = cursor.next().await?;
+    }
+    drop(cursor);
     drop(tx);
     tree.close().await
 }
@@ -36,8 +44,8 @@ async fn example() -> kvshare::Result<()> {
 |---|---|---|
 | S0 | This repository, with the spike's code split into modules | done |
 | S1 | `TreeBuilder`, `Tree`, `Transaction` with SurrealKV's names; point reads and writes, savepoints, commit and rollback | done |
-| S2 | Cursors with `seek`, `next`, `prev`; history | next |
-| S3 | `Tree`'s administrative operations through the owner | |
+| S2 | Cursors with `seek`, `next`, `prev`; history | done |
+| S3 | `Tree`'s administrative operations through the owner | next |
 | S4 | Robustness, Linux, documentation | |
 
 ## Boundaries
@@ -49,8 +57,9 @@ async fn example() -> kvshare::Result<()> {
 ## Mapping to SurrealKV's API
 
 The rule: kvshare keeps SurrealKV's type and method names, and a method is `async`
-when it may reach the owner: opening the tree, `begin`, every read and `commit`. Writes,
-savepoints and `rollback` stay synchronous. A client keeps a transaction's writes until
+when it may reach the owner: opening the tree, `begin`, every read, the moves of a
+cursor and `commit`. Writes, savepoints, `rollback` and opening a cursor stay
+synchronous. A client keeps a transaction's writes until
 its next read or its commit, which carry them to the owner in their order; the owner
 applies each by the SurrealKV method the client called, so SurrealKV itself decides what
 the transaction sees.
@@ -66,7 +75,12 @@ the transaction sees.
 | `Transaction::set_savepoint`, `rollback_to_savepoint`, `rollback`, `set_durability`, `with_durability` | the same | synchronous |
 | `Transaction::get`, `get_async`, `get_with`, `get_with_options`, `get_for_update`, `get_many`, `get_many_with`, `get_at`, `get_at_with`, `get_many_at`, `get_many_at_with` | the same, `async` | a client runs the closures on the answer |
 | `Transaction::commit` | the same | |
-| `Transaction::range`, `history_with_options` and `LSMIterator` | `range`, `history`: cursors of kvshare's own, read in pages | until S2 |
+| `Transaction::iter`, `scan`, `range`, `range_with_options`, `history`, `history_with_options` | the same | they return a `Cursor` |
+| `LSMIterator`: `seek`, `seek_first`, `seek_last`, `next`, `prev` | `Cursor`: the same, `async` | `seek` takes a user's key, as SurrealKV's transaction iterators do |
+| `LSMIterator`: `valid`, `key`, `value`, `value_ref`, `value_into` | `Cursor`: the same | `key` returns kvshare's `InternalKeyRef`, with SurrealKV's methods |
+| `LSMIterator`: `value_encoded`, `reanchor_first`, `reanchor_last` | none | a client has the values resolved; the re-anchors serve SurrealKV's merging iterators |
+| `KeyRange`, `ReadOptions::from_range` | the same | kvshare's own: SurrealKV keeps `KeyRange` in a private module |
+| `HistoryOptions`, `InternalKeyKind` | the same | SurrealKV's |
 | `Tree::create_checkpoint` and the other administrative operations | none yet | S3 |
 
 kvshare adds:
@@ -75,7 +89,23 @@ kvshare adds:
   the temporary directory), `with_election_timeout`, `with_call_timeout`;
 - `TreeBuilder::current_owner`: the owner's pid, asked over its socket, without taking
   part in the election;
-- `Tree::is_owner`, `Tree::owner_pid`, `Transaction::is_local`.
+- `Tree::is_owner`, `Tree::owner_pid`, `Transaction::is_local`;
+- `Cursor::set_page_size`: how many entries a cursor reads at once, 256 unless set.
+
+## Cursors
+
+A cursor is a window of entries read one page at a time. Moving past either end of the
+window reads the page beyond it: in the owner from SurrealKV in the same process, in a
+client by one request to the owner. A cursor keeps no SurrealKV iterator between moves,
+because that iterator cannot cross threads and a cursor whose moves are awaited has to.
+
+Each page is a new SurrealKV iterator on the same transaction, so the pages of a cursor
+see one snapshot and the same writes; the cursor keeps its transaction borrowed, so no
+write comes between them. A page names its entries by key and by which of the key's
+versions each is, and the next page starts next to such an entry. The cursor itself
+repeats what SurrealKV's iterators do: a cursor not yet positioned seeks on its first
+move, an exhausted one stays so until a seek, and a history's `limit` is spent by each
+entry a move lands on, kept across a change of direction and renewed by a seek.
 
 The processes of one database must agree on the options that change what is stored: the
 versions kept and their retention, the comparator, the value log and encryption. A
@@ -99,15 +129,17 @@ clients see the same error for the same operation; SurrealKV's other errors are
 
 ## Where kvshare differs from SurrealKV
 
-- Reads, `begin`, opening and `commit` are `async`.
+- Reads, `begin`, opening the tree, the moves of a cursor and `commit` are `async`.
 - A range or a history whose start lies past its end is empty. SurrealKV 1.4.0 panics
   on one once the transaction holds a write, and a client must not bring down the
   owner's task.
-- Range and history reads are kvshare's own cursors, read in pages, until S2 repeats
-  SurrealKV's iterators.
+- A cursor reads each value of its page, even if only keys are looked at.
+- Finding an entry again for the next page steps through the versions of its key, so a
+  history of a key with very many versions read in small pages reads them repeatedly.
 
 `tests/differential.rs` runs the same scenarios on SurrealKV itself, on an owner's tree
-and through a client, and requires every answer, a value or an error, to be the same.
+and through a client, the cursors with pages of 1, 2 and 256 entries, and requires every
+answer, a value or an error, to be the same.
 
 ## SurrealKV 1.4.0 gaps kvshare works around
 
@@ -119,6 +151,9 @@ and through a client, and requires every answer, a value or an error, to be the 
   tree in an `Arc` and never clones it.
 - `range` and `history_with_options` panic on a start past the end once the transaction
   holds a write; kvshare answers with nothing.
+- `InternalKeyRef::with_timestamp` is crate-private, so no one else can make a key that
+  carries its time; kvshare's `InternalKeyRef` reads the key with SurrealKV's and keeps
+  the time beside it.
 
 ## What was measured
 
@@ -129,17 +164,17 @@ commit a writer had seen return, with `Durability::Eventual` and `Immediate`
 (`tests/failover.rs`; in the spike, the first commit after a kill came 40 to 70 ms
 later, median).
 
-`kv-latency 10000` at S1, with a load average of about 5 (medians, p99 in brackets):
+`kv-latency 10000` at S2, with a load average of about 5 (medians, p99 in brackets):
 
 | Operation | In the owner | Through the socket |
 |---|---|---|
-| `get` in an open transaction | 0.1 µs (0.1) | 12.5 µs (29.7) |
-| `begin` + `get` + `rollback` | 0.2 µs (1.7) | 15.8 µs (35.8) |
-| `begin` + `set` + `commit`, `Eventual` | 11.2 µs (44.8) | 20.0 µs (38.4) |
-| `begin` + `set` + `commit`, `Immediate` | 4.0 ms (7.1) | 4.0 ms (5.1) |
-| `get` + `set` + `commit`, `Eventual` | 11.2 µs (38.7) | 24.8 µs (63.8) |
-| scan of 1000 keys, pages of 256 | 0.44 ms (1.2) | 0.78 ms (0.94) |
-| a bare socket round trip, 64 B | | 12.4 µs (36.1) |
+| `get` in an open transaction | 0.1 µs (0.1) | 15.1 µs (28.8) |
+| `begin` + `get` + `rollback` | 0.2 µs (0.2) | 17.4 µs (33.3) |
+| `begin` + `set` + `commit`, `Eventual` | 11.2 µs (16.2) | 20.0 µs (35.4) |
+| `begin` + `set` + `commit`, `Immediate` | 4.0 ms (5.0) | 4.0 ms (4.9) |
+| `get` + `set` + `commit`, `Eventual` | 11.1 µs (21.8) | 35.1 µs (54.1) |
+| a cursor over 1000 keys, pages of 256 | 0.47 ms (0.55) | 0.83 ms (0.94) |
+| a bare socket round trip, 64 B | | 14.2 µs (17.8) |
 
 A read through the owner costs one socket round trip: `begin` and `rollback` do not
 wait for the owner.
@@ -153,8 +188,9 @@ cargo test
 - `tests/differential.rs`: the same scenarios on SurrealKV, an owner and a client.
 - `tests/handover.rs`: the election, hand-over, conflicts, a client's own writes, many
   tasks of one client, a client that leaves, the bound on open transactions.
-- `tests/scan.rs`: range and history reads in pages, the same in the owner and through
-  the socket.
+- `tests/scan.rs`: cursors over ranges and histories in pages, the same in the owner
+  and through the socket; a reversed range; a history of a tree without versions; a
+  cursor moved in a spawned task.
 - `tests/failover.rs`: writers in several processes while the owner is killed again
   and again.
 

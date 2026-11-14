@@ -20,8 +20,12 @@
 //! every read and the commit carry them, and the owner applies them to the transaction
 //! in their order, each by the SurrealKV method the client called, before the read or
 //! the commit. A read then is SurrealKV's own read of that transaction, which sees the
-//! transaction's writes. Range and history reads come in pages: each page is a new read
-//! of the same transaction.
+//! transaction's writes.
+//!
+//! A cursor of a client reads in pages. Each page is a new SurrealKV iterator on the same
+//! transaction, so the pages see the same snapshot and the same writes; it starts at the
+//! first entry, the last, the first at or past a key, or next to an entry of an earlier
+//! page, which the page names by its [`Position`].
 
 use std::io;
 use std::path::PathBuf;
@@ -34,7 +38,7 @@ use crate::error::KvError;
 use crate::types::{WireDurability, WireMode};
 
 /// The version of the protocol. Bump it when a message would mean something else.
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 5;
 
 /// How many transactions one connection may hold open at once.
 pub const MAX_TRANSACTIONS: usize = 64;
@@ -42,8 +46,8 @@ pub const MAX_TRANSACTIONS: usize = 64;
 /// The largest frame either side accepts: a longer one is a broken peer.
 pub const MAX_FRAME: u32 = 64 << 20;
 
-/// How many entries or versions a page of a range or history read holds unless the
-/// reader asks for another number.
+/// How many entries a page of a client's cursor holds unless the cursor asks for another
+/// number.
 pub const DEFAULT_PAGE: usize = 256;
 
 /// The keys and values a page holds at most before it stops early; a page always holds
@@ -55,9 +59,6 @@ pub type TxId = u64;
 
 /// A request's number on its connection; the answer carries it back.
 pub type RequestId = u64;
-
-/// A key and its value, as a range read returns them.
-pub type Entry = (Vec<u8>, Vec<u8>);
 
 /// What the owner hands a connection when it begins.
 #[derive(Debug, Serialize, Deserialize)]
@@ -117,23 +118,118 @@ pub(crate) enum Write {
     RollbackToSavepoint,
 }
 
-/// Which versions a history read returns besides the values: tombstones or not, and only
-/// those written between two times (nanoseconds, both included) or all.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HistoryFilter {
-    pub tombstones: bool,
-    pub between: Option<(u64, u64)>,
+/// What a cursor reads: SurrealKV's `range_with_options` or `history_with_options`.
+///
+/// A history's limit is not here: the client spends it, as SurrealKV's iterator does,
+/// and the owner reads every page without one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum Source {
+    /// The newest value of each key in `[lower, upper)`, `None` for no bound.
+    Range {
+        lower: Option<Vec<u8>>,
+        upper: Option<Vec<u8>>,
+    },
+    /// Every version of the keys in `[start, end)`; tombstones or not, and only those
+    /// written between two times (nanoseconds, both included) or all.
+    History {
+        start: Vec<u8>,
+        end: Vec<u8>,
+        tombstones: bool,
+        between: Option<(u64, u64)>,
+    },
 }
 
-/// One version of a key in a history read.
+impl Source {
+    /// The same source, with a start past its end narrowed to nothing. SurrealKV 1.4
+    /// panics on such a range once the transaction holds a write (it is a range of the
+    /// transaction's `BTreeMap` of writes); an empty one holds the same keys, none, and
+    /// SurrealKV still checks the transaction before it answers with nothing.
+    pub(crate) fn narrowed(mut self) -> Self {
+        match &mut self {
+            Source::Range {
+                lower: Some(lower),
+                upper: Some(upper),
+            } => {
+                if *lower > *upper {
+                    *upper = lower.clone();
+                }
+            }
+            Source::History { start, end, .. } => {
+                if *start > *end {
+                    *end = start.clone();
+                }
+            }
+            Source::Range { .. } => {}
+        }
+        self
+    }
+}
+
+/// Where a page of a cursor starts, and so which way it reads.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Version {
-    pub key: Vec<u8>,
-    /// When it was written, in nanoseconds; `u64::MAX` for a write of the reading
-    /// transaction itself, which has no time until it commits.
-    pub timestamp: u64,
-    /// The value, or `None` for a tombstone.
-    pub value: Option<Vec<u8>>,
+pub(crate) enum At {
+    /// `seek_first`, then forwards.
+    First,
+    /// `seek_last`, then backwards.
+    Last,
+    /// `seek(key)`, then forwards.
+    Seek(Vec<u8>),
+    /// The entry after this one, then forwards.
+    After(Position),
+    /// The entry before this one, then backwards.
+    Before(Position),
+}
+
+impl At {
+    /// Whether a page that starts here reads forwards.
+    pub(crate) fn forwards(&self) -> bool {
+        !matches!(self, At::Last | At::Before(_))
+    }
+}
+
+/// An entry of a cursor, as a later page can find it again: its key, and which of the
+/// key's entries it is, counted from the newest or from the oldest. A range has one entry
+/// a key; a history has a version an entry, the newest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Position {
+    pub(crate) key: Vec<u8>,
+    pub(crate) nth: Nth,
+}
+
+/// Which of a key's entries, counted from one end of the key's entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum Nth {
+    /// The newest is 0.
+    FromNewest(u64),
+    /// The oldest is 0.
+    FromOldest(u64),
+}
+
+/// One entry of a page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Item {
+    /// The key as SurrealKV encodes it: the user's key, then the sequence number and the
+    /// kind of the write.
+    pub(crate) key: Vec<u8>,
+    /// When the version was written: SurrealKV reports it for a history and 0 for a range.
+    pub(crate) timestamp: u64,
+    pub(crate) nth: Nth,
+    /// What SurrealKV's `value()` answered for it.
+    pub(crate) value: Result<Vec<u8>, KvError>,
+}
+
+impl Item {
+    /// The user's key, without SurrealKV's trailer.
+    pub(crate) fn user_key(&self) -> &[u8] {
+        surrealkv::InternalKeyRef::from_encoded(&self.key).user_key()
+    }
+
+    pub(crate) fn position(&self) -> Position {
+        Position {
+            key: self.user_key().to_vec(),
+            nth: self.nth,
+        }
+    }
 }
 
 /// What a client asks the owner. Every request on a transaction carries the writes the
@@ -171,24 +267,12 @@ pub(crate) enum Request {
         keys: Vec<Vec<u8>>,
         timestamp: u64,
     },
-    /// Up to `limit` entries of `[start, end)` in key order, or in reverse.
-    Range {
+    /// A page of up to `limit` entries of `source`, from `at`.
+    Cursor {
         tx: TxId,
         writes: Vec<Write>,
-        start: Vec<u8>,
-        end: Vec<u8>,
-        reverse: bool,
-        limit: u32,
-    },
-    /// Up to `limit` versions of the keys of `[start, end)` that pass `filter`, past the
-    /// first `skip` versions of `start`.
-    History {
-        tx: TxId,
-        writes: Vec<Write>,
-        start: Vec<u8>,
-        end: Vec<u8>,
-        skip: u64,
-        filter: HistoryFilter,
+        source: Source,
+        at: At,
         limit: u32,
     },
     /// Commit transaction `tx`, whose commit returns as `durability` says. The
@@ -207,14 +291,9 @@ pub(crate) enum Request {
 pub(crate) enum Answer {
     Got(Option<Vec<u8>>),
     GotMany(Vec<Option<Vec<u8>>>),
-    /// A page of a range read, and whether more follow.
-    Ranged {
-        entries: Vec<Entry>,
-        more: bool,
-    },
-    /// A page of a history read, and whether more follow.
-    Versions {
-        versions: Vec<Version>,
+    /// A page of a cursor, in the order it was read, and whether more follow that way.
+    Page {
+        items: Vec<Item>,
         more: bool,
     },
     Committed,

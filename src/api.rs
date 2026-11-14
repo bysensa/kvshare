@@ -9,6 +9,8 @@
 //! itself decides what the transaction sees. A client checks at once what SurrealKV
 //! checks at once: a closed transaction, a read-only one, an empty key, a missing
 //! savepoint. Any other error of a write comes with the next request that carries it.
+//!
+//! Cursors are opened synchronously, as SurrealKV's iterators are, and move `async`.
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -17,18 +19,18 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use surrealkv::{
-    CipherPreference, Comparator, CompressionType, Durability, FilterPolicy, IntoBytes, KeyManager,
-    Mode, Options, VLogChecksumLevel, Value, WalRecoveryMode, WriteOptions,
+    CipherPreference, Comparator, CompressionType, Durability, FilterPolicy, HistoryOptions,
+    IntoBytes, KeyManager, Mode, Options, VLogChecksumLevel, Value, WalRecoveryMode, WriteOptions,
 };
 
 use crate::client::{Connection, Lost};
+use crate::cursor::Cursor;
 use crate::election::{Current, Role, connect};
 use crate::endpoint::Endpoint;
 use crate::error::{Error, Result};
-use crate::exec::{history_page, range_page};
-use crate::protocol::{Answer, Entry, HistoryFilter, Request, TxId, Version, Write};
-use crate::scan::{History, Scan};
-use crate::types::{ReadOptions, WireDurability, WireMode, fingerprint};
+use crate::exec::{open, page};
+use crate::protocol::{Answer, At, Item, Request, Source, TxId, Write};
+use crate::types::{KeyRange, ReadOptions, WireDurability, WireMode, fingerprint};
 
 /// Builds a [`Tree`], as SurrealKV's `TreeBuilder` does, with the same options; and the
 /// few that kvshare adds: where the owners' sockets live and how long to wait for an
@@ -840,17 +842,82 @@ impl Transaction {
         }
     }
 
-    /// The entries of `[start, end)` as this transaction sees them, read in pages. Until
-    /// kvshare repeats SurrealKV's iterators, this is a cursor of its own.
-    pub fn range(&mut self, start: &[u8], end: &[u8]) -> Scan<'_> {
-        Scan::new(self, start, end)
+    /// A cursor over every key, as this transaction sees it.
+    pub fn iter(&self) -> Result<Cursor<'_>> {
+        self.range_with_options(&ReadOptions::default())
     }
 
-    /// The versions of the keys of `[start, end)`, keys in order and the versions of a
-    /// key newest first, read in pages. The tree must keep versions. Until kvshare
-    /// repeats SurrealKV's iterators, this is a cursor of its own.
-    pub fn history(&mut self, start: &[u8], end: &[u8]) -> History<'_> {
-        History::new(self, start, end)
+    /// A cursor over the keys of `range`: `..`, `a..b`, `a..=b`, `a..`, `..b` or `..=b`.
+    pub fn scan<R: KeyRange>(&self, range: R) -> Result<Cursor<'_>> {
+        self.range_with_options(&ReadOptions::from_range(range))
+    }
+
+    /// A cursor over the keys of `[start, end)`.
+    pub fn range<K: IntoBytes>(&self, start: K, end: K) -> Result<Cursor<'_>> {
+        let mut options = ReadOptions::default();
+        options.set_iterate_lower_bound(Some(start.into_bytes()));
+        options.set_iterate_upper_bound(Some(end.into_bytes()));
+        self.range_with_options(&options)
+    }
+
+    /// A cursor over the keys between the bounds of `options`: the newest value of each
+    /// key as this transaction sees it, its own writes included.
+    pub fn range_with_options(&self, options: &ReadOptions) -> Result<Cursor<'_>> {
+        let source = Source::Range {
+            lower: options.lower_bound.clone(),
+            upper: options.upper_bound.clone(),
+        };
+        self.cursor(source, None)
+    }
+
+    /// A cursor over every version of the keys of `[start, end)`.
+    pub fn history<K: IntoBytes>(&self, start: K, end: K) -> Result<Cursor<'_>> {
+        self.history_with_options(start, end, &HistoryOptions::default())
+    }
+
+    /// A cursor over the versions of the keys of `[start, end)` that `options` lets
+    /// through: keys in order, the versions of a key newest first. The tree must keep
+    /// versions.
+    pub fn history_with_options<K: IntoBytes>(
+        &self,
+        start: K,
+        end: K,
+        options: &HistoryOptions,
+    ) -> Result<Cursor<'_>> {
+        let source = Source::History {
+            start: start.into_bytes(),
+            end: end.into_bytes(),
+            tombstones: options.include_tombstones,
+            between: options.ts_range,
+        };
+        self.cursor(source, options.limit)
+    }
+
+    /// A cursor over `source`, spending `limit` if it is a history. Opening checks what
+    /// SurrealKV checks when it opens an iterator, in SurrealKV's order: whether the
+    /// transaction is closed, whether it may read, and, for a history, whether the tree
+    /// keeps versions. In the owner SurrealKV checks it, opening an iterator it drops; a
+    /// client checks it itself.
+    fn cursor(&self, source: Source, limit: Option<usize>) -> Result<Cursor<'_>> {
+        let source = source.narrowed();
+        match &self.state {
+            State::Local(transaction) => {
+                open(transaction, &source)?;
+            }
+            State::Remote(remote) => {
+                if remote.closed {
+                    return Err(Error::TransactionClosed);
+                }
+                if remote.mode == WireMode::WriteOnly {
+                    return Err(Error::TransactionWriteOnly);
+                }
+                if matches!(source, Source::History { .. }) && !self.inner.options.enable_versioning
+                {
+                    return Err(Error::InvalidArgument("Versioning not enabled".into()));
+                }
+            }
+        }
+        Ok(Cursor::new(self, source, limit))
     }
 
     pub async fn commit(&mut self) -> Result<()> {
@@ -897,67 +964,31 @@ impl Transaction {
         }
     }
 
-    /// A page of a range read.
-    pub(crate) async fn range_page(
+    /// A page of a cursor over `source`: up to `limit` entries from `at`, in the order
+    /// they were read, and whether more follow that way. In a client the owner reads it,
+    /// and the first page carries the writes the transaction has kept.
+    pub(crate) async fn page(
         &self,
-        start: &[u8],
-        end: &[u8],
-        reverse: bool,
+        source: &Source,
+        at: At,
         limit: usize,
-    ) -> Result<(Vec<Entry>, bool)> {
-        match &self.state {
-            State::Local(transaction) => Ok(range_page(transaction, start, end, reverse, limit)?),
-            State::Remote(remote) => {
-                let answer = remote
-                    .ask(&self.inner, self.generation, |tx, writes| Request::Range {
-                        tx,
-                        writes,
-                        start: start.to_vec(),
-                        end: end.to_vec(),
-                        reverse,
-                        limit: u32::try_from(limit).unwrap_or(u32::MAX),
-                    })
-                    .await?;
-                match answer {
-                    Answer::Ranged { entries, more } => Ok((entries, more)),
-                    other => Err(out_of_turn(other)),
-                }
-            }
-        }
-    }
-
-    /// A page of a history read.
-    pub(crate) async fn history_page(
-        &self,
-        start: &[u8],
-        end: &[u8],
-        skip: u64,
-        filter: HistoryFilter,
-        limit: usize,
-    ) -> Result<(Vec<Version>, bool)> {
-        match &self.state {
-            State::Local(transaction) => {
-                Ok(history_page(transaction, start, end, skip, filter, limit)?)
-            }
-            State::Remote(remote) => {
-                let answer = remote
-                    .ask(&self.inner, self.generation, |tx, writes| {
-                        Request::History {
-                            tx,
-                            writes,
-                            start: start.to_vec(),
-                            end: end.to_vec(),
-                            skip,
-                            filter,
-                            limit: u32::try_from(limit).unwrap_or(u32::MAX),
-                        }
-                    })
-                    .await?;
-                match answer {
-                    Answer::Versions { versions, more } => Ok((versions, more)),
-                    other => Err(out_of_turn(other)),
-                }
-            }
+    ) -> Result<(Vec<Item>, bool)> {
+        let remote = match &self.state {
+            State::Local(transaction) => return Ok(page(transaction, source, at, limit)?),
+            State::Remote(remote) => remote,
+        };
+        let answer = remote
+            .ask(&self.inner, self.generation, |tx, writes| Request::Cursor {
+                tx,
+                writes,
+                source: source.clone(),
+                at,
+                limit: u32::try_from(limit).unwrap_or(u32::MAX),
+            })
+            .await?;
+        match answer {
+            Answer::Page { items, more } => Ok((items, more)),
+            other => Err(out_of_turn(other)),
         }
     }
 }

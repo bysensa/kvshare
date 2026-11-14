@@ -194,15 +194,17 @@ async fn measure(
     let mut scan = Vec::with_capacity(iterations / 20);
     for _ in 0..iterations / 20 {
         let started = Instant::now();
-        let mut tx = tree.begin().await?;
+        let tx = tree.begin().await?;
         let mut read = 0;
         {
-            let mut entries = tx.range(b"key-", b"key.");
-            while entries.next().await?.is_some() {
+            let mut entries = tx.range(b"key-", b"key.")?;
+            let mut valid = entries.seek_first().await?;
+            while valid {
                 read += 1;
+                valid = entries.next().await?;
             }
         }
-        tx.rollback();
+        drop(tx);
         scan.push(started.elapsed());
         assert_eq!(read, KEYS, "the scan reads every key");
     }
