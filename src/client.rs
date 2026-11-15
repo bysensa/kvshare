@@ -79,8 +79,9 @@ impl Connection {
         answered.await.map_err(|_| ended())
     }
 
-    /// Send `request`, which has no answer, without waiting.
-    pub async fn send(&self, request: Request) -> Result<(), Lost> {
+    /// Send `request`, which has no answer, without waiting. It needs no runtime: a
+    /// transaction dropped on any thread rolls back through it.
+    pub fn send(&self, request: Request) -> Result<(), Lost> {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         self.queue(id, &request)
     }

@@ -276,10 +276,12 @@ impl Inner {
     /// Where an operation goes, after an election if no role is held. The role is not
     /// borrowed past the return, so a failed request can forget it.
     async fn route(&self) -> Result<Route> {
+        let mut current = self.current.lock().await;
+        // Looked at with the role held: a close that took the role while this call
+        // waited for it must not be answered with a new election.
         if self.closed.load(Ordering::Acquire) {
             return Err(Error::Engine("the tree is closed".into()));
         }
-        let mut current = self.current.lock().await;
         let current = self.held(&mut current).await?;
         Ok(match &current.role {
             Role::Owner(owner) => Route::Local {
@@ -373,7 +375,7 @@ impl Tree {
                     mode: wire_mode,
                     durability: WireDurability::Eventual,
                 };
-                if let Err(Lost(reason)) = connection.send(begin).await {
+                if let Err(Lost(reason)) = connection.send(begin) {
                     self.inner.forget(generation).await;
                     return Err(Error::OwnerLost(reason));
                 }
@@ -1192,15 +1194,10 @@ impl Drop for Transaction {
     }
 }
 
-/// Roll the transaction back in the owner without waiting, if there is a runtime to
-/// send it from. An owner that is gone has rolled it back already.
+/// Roll the transaction back in the owner without waiting, from whatever thread drops
+/// it. An owner that is gone has rolled it back already.
 fn end_in_owner(remote: &Remote) {
-    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-        let (connection, tx) = (Arc::clone(&remote.connection), remote.id);
-        runtime.spawn(async move {
-            let _ = connection.send(Request::Rollback { tx }).await;
-        });
-    }
+    let _ = remote.connection.send(Request::Rollback { tx: remote.id });
 }
 
 fn got(answer: Answer) -> Result<Option<Value>> {

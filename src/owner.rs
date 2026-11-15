@@ -103,13 +103,24 @@ impl Owner {
     /// and they elect the next owner once the lock is released. A compaction under way
     /// is waited for to its end, see [`Maintenance`]; one asked for meanwhile finds the
     /// tree closed.
-    pub(crate) async fn close(self) -> Result<(), surrealkv::Error> {
+    pub(crate) async fn close(mut self) -> Result<(), surrealkv::Error> {
         // Aborting the accept task drops its set of connections, which aborts them.
         self.accept.abort();
-        let _ = self.accept.await;
+        let _ = (&mut self.accept).await;
         let _quiet = self.maintenance.write().await;
         let _ = std::fs::remove_file(&self.socket);
         self.tree.close().await
+    }
+}
+
+/// An owner dropped without a close lets the database go too, as SurrealKV's tree does
+/// when it is dropped. A `JoinHandle` that is dropped leaves its task running, and the
+/// accept task holds the tree and the socket, so it is aborted here; once it and its
+/// connections are gone, SurrealKV closes the tree that nothing holds any more, on the
+/// runtime. The socket file stays, as after a crash, and the next owner removes it.
+impl Drop for Owner {
+    fn drop(&mut self) {
+        self.accept.abort();
     }
 }
 
