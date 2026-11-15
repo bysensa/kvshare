@@ -26,7 +26,10 @@ async fn a_tree_dropped_without_close_lets_the_database_go() {
         "the dropped tree no longer owns or serves the database"
     );
     let tx = second.begin().await.expect("a transaction");
-    assert_eq!(tx.get(b"k").await.expect("a read").as_deref(), Some(&b"v"[..]));
+    assert_eq!(
+        tx.get(b"k").await.expect("a read").as_deref(),
+        Some(&b"v"[..])
+    );
     drop(tx);
     second.close().await.expect("the tree closes");
     let _ = std::fs::remove_dir_all(&base);

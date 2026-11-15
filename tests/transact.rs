@@ -152,10 +152,16 @@ async fn transactions_that_conflict_all_commit_once() {
     let (owner, client) = owner_and_client(&base).await;
     let mut tasks = Vec::new();
     for task in 0..8 {
-        let tree = if task % 2 == 0 { owner.clone() } else { client.clone() };
+        let tree = if task % 2 == 0 {
+            owner.clone()
+        } else {
+            client.clone()
+        };
         tasks.push(tokio::spawn(async move {
             for n in 0..20 {
-                add_one(&tree, format!("{task}-{n}")).await.expect("an addition");
+                add_one(&tree, format!("{task}-{n}"))
+                    .await
+                    .expect("an addition");
             }
         }));
     }
@@ -172,7 +178,8 @@ async fn transactions_that_conflict_all_commit_once() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_commit_the_owner_was_silent_about_is_not_applied_twice() {
     let base = base("tr2");
-    let (mut owner, said) = worker(&["serve", path(&base.join("db")), path(&base.join("run"))]).await;
+    let (mut owner, said) =
+        worker(&["serve", path(&base.join("db")), path(&base.join("run"))]).await;
     assert_eq!(said, "owner");
     let pid = owner.id().expect("a running owner");
     let client = client_of(&base, Duration::from_millis(150)).await;
@@ -206,7 +213,8 @@ async fn a_commit_the_owner_was_silent_about_is_not_applied_twice() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn transactions_go_on_with_the_next_owner() {
     let base = base("tr3");
-    let (mut owner, said) = worker(&["serve", path(&base.join("db")), path(&base.join("run"))]).await;
+    let (mut owner, said) =
+        worker(&["serve", path(&base.join("db")), path(&base.join("run"))]).await;
     assert_eq!(said, "owner");
     let client = client_of(&base, Duration::from_secs(2)).await;
     for n in 0..50 {
@@ -214,9 +222,14 @@ async fn transactions_go_on_with_the_next_owner() {
             owner.start_kill().expect("SIGKILL to the owner");
             owner.wait().await.expect("the owner exits");
         }
-        add_one(&client, format!("solo-{n}")).await.expect("an addition");
+        add_one(&client, format!("solo-{n}"))
+            .await
+            .expect("an addition");
     }
-    assert!(client.is_owner().await.expect("a role"), "this process took over");
+    assert!(
+        client.is_owner().await.expect("a role"),
+        "this process took over"
+    );
     assert_eq!(counter(&client).await, 50);
     client.close().await.expect("the tree closes");
     let _ = std::fs::remove_dir_all(&base);
@@ -228,16 +241,18 @@ async fn transactions_go_on_with_the_next_owner() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_transaction_gives_up_on_what_repeating_does_not_cure() {
     let base = base("tr4");
-    let (mut owner, said) = worker(&["serve", path(&base.join("db")), path(&base.join("run"))]).await;
+    let (mut owner, said) =
+        worker(&["serve", path(&base.join("db")), path(&base.join("run"))]).await;
     assert_eq!(said, "owner");
     let pid = owner.id().expect("a running owner");
     let client = client_of(&base, Duration::from_millis(100)).await;
 
     let mut refused = Refused(0);
-    let answer = client
-        .transact(Duration::from_secs(20), &mut refused)
-        .await;
-    assert!(matches!(answer, Err(Error::InvalidArgument(_))), "{answer:?}");
+    let answer = client.transact(Duration::from_secs(20), &mut refused).await;
+    assert!(
+        matches!(answer, Err(Error::InvalidArgument(_))),
+        "{answer:?}"
+    );
     assert_eq!(refused.0, 1, "asked once");
 
     signal("STOP", pid).await;
@@ -247,11 +262,16 @@ async fn a_transaction_gives_up_on_what_repeating_does_not_cure() {
         applied: 0,
         found: 0,
     };
-    let silent = client
-        .transact(Duration::from_millis(600), &mut mark)
-        .await;
-    assert!(matches!(silent, Err(Error::OwnerSilent { .. })), "{silent:?}");
-    assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
+    let silent = client.transact(Duration::from_millis(600), &mut mark).await;
+    assert!(
+        matches!(silent, Err(Error::OwnerSilent { .. })),
+        "{silent:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
 
     signal("CONT", pid).await;
     drop(client);

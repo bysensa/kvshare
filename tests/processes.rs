@@ -364,7 +364,9 @@ async fn a_stopped_owner_does_not_fill_the_clients_memory() {
             .build()
     };
     let client = open(Duration::from_millis(50)).await.expect("the client");
-    let watcher = open(Duration::from_secs(30)).await.expect("a second client");
+    let watcher = open(Duration::from_secs(30))
+        .await
+        .expect("a second client");
 
     signal("STOP", pid).await;
     let value = vec![7u8; 1 << 20];

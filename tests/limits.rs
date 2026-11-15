@@ -24,7 +24,9 @@ async fn a_client_commits_more_than_a_frame_holds() {
     for key in keys('a') {
         tx.set(key, &value).expect("a write");
     }
-    tx.commit().await.expect("a commit of 70 MiB through the owner");
+    tx.commit()
+        .await
+        .expect("a commit of 70 MiB through the owner");
 
     let tx = owner.begin().await.expect("a transaction");
     let read = tx.get_many(&keys('a')).await.expect("the owner reads");
@@ -76,7 +78,8 @@ async fn an_entry_over_the_limit_is_refused_alike_by_the_owner_and_a_client() {
             matches!(tx.set(b"k", &huge), Err(Error::TooLarge(_))),
             "the {role} refuses a key and a value of more than {MAX_ENTRY} bytes"
         );
-        tx.set(role.as_bytes(), b"small").expect("a write that fits");
+        tx.set(role.as_bytes(), b"small")
+            .expect("a write that fits");
         tx.commit().await.expect("the transaction works on");
     }
     let tx = client.begin().await.expect("a transaction");
@@ -106,12 +109,18 @@ async fn a_request_no_frame_holds_keeps_the_transactions_writes() {
         "the read is refused before it is sent"
     );
     assert_eq!(
-        tx.get(b"k").await.expect("the same transaction reads").as_deref(),
+        tx.get(b"k")
+            .await
+            .expect("the same transaction reads")
+            .as_deref(),
         Some(&b"v"[..]),
         "the write the refused read would have carried is still the transaction's"
     );
     tx.commit().await.expect("a commit");
-    assert!(!client.is_owner().await.expect("a role"), "the owner is the same");
+    assert!(
+        !client.is_owner().await.expect("a role"),
+        "the owner is the same"
+    );
     close(owner, client, &base).await;
 }
 
@@ -128,7 +137,8 @@ async fn a_client_reads_more_keys_than_one_request_asks_for() {
     let mut tx = owner.begin().await.expect("a transaction");
     for (n, key) in keys.iter().enumerate() {
         if n % 7 != 0 {
-            tx.set(key, format!("value {n}").into_bytes()).expect("a write");
+            tx.set(key, format!("value {n}").into_bytes())
+                .expect("a write");
         }
     }
     tx.commit().await.expect("the owner's commit");
@@ -137,7 +147,10 @@ async fn a_client_reads_more_keys_than_one_request_asks_for() {
     let remote = client.begin().await.expect("a transaction");
     let expected = local.get_many(&keys).await.expect("the owner reads");
     assert_eq!(expected.iter().filter(|value| value.is_none()).count(), 143);
-    assert_eq!(remote.get_many(&keys).await.expect("the client reads"), expected);
+    assert_eq!(
+        remote.get_many(&keys).await.expect("the client reads"),
+        expected
+    );
     assert_eq!(
         remote.get_many::<Vec<u8>>(&[]).await.expect("no keys"),
         Vec::<Option<Vec<u8>>>::new()

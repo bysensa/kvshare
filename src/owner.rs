@@ -505,7 +505,10 @@ mod tests {
             "the next request learns why the writes were refused"
         );
         assert!(
-            matches!(table.on(1, Vec::new(), read(b"a")), Ok(Answer::Got(Some(_)))),
+            matches!(
+                table.on(1, Vec::new(), read(b"a")),
+                Ok(Answer::Got(Some(_)))
+            ),
             "the write before the refused one was applied"
         );
         assert!(
@@ -535,7 +538,9 @@ mod versions {
         let me = crate::endpoint::uid().expect("this process's user");
         let owner = Owner::start(tree, &endpoint, [0; 32], me).expect("an owner");
 
-        let mut stranger = UnixStream::connect(&endpoint.socket).await.expect("connected");
+        let mut stranger = UnixStream::connect(&endpoint.socket)
+            .await
+            .expect("connected");
         let welcome: Welcome = read_frame(&mut stranger).await.expect("a welcome");
         assert_eq!((welcome.oldest, welcome.version), (OLDEST, VERSION));
         let hello = Hello {
@@ -559,7 +564,9 @@ mod versions {
             "the owner hangs up on a version it does not speak"
         );
 
-        let mut client = UnixStream::connect(&endpoint.socket).await.expect("connected");
+        let mut client = UnixStream::connect(&endpoint.socket)
+            .await
+            .expect("connected");
         let _: Welcome = read_frame(&mut client).await.expect("a welcome");
         let hello = Hello { version: VERSION };
         write_frame(&mut client, &hello).await.expect("a hello");
@@ -573,7 +580,9 @@ mod versions {
             },
         );
         write_frame(&mut client, &begin).await.expect("a begin");
-        write_frame(&mut client, &(2u64, read.1)).await.expect("a read");
+        write_frame(&mut client, &(2u64, read.1))
+            .await
+            .expect("a read");
         let (id, answer): (RequestId, Answer) = read_frame(&mut client).await.expect("an answer");
         assert_eq!(id, 2);
         assert!(matches!(answer, Answer::Got(None)), "{answer:?}");

@@ -5,8 +5,9 @@ processes on one machine, behind SurrealKV's own API.
 
 SurrealKV lets one process open a database: opening takes an exclusive `flock` on
 `<db>/LOCK`. kvshare turns that lock into an election. The process that opens the
-database owns it and serves it on a Unix socket. A process that finds the database
-locked connects to that socket and works through the owner. When the owner exits or
+database owns it and serves it on a Unix socket, whose path it leaves in the
+database's directory. A process that finds the database locked connects to that socket
+and works through the owner. When the owner exits or
 dies, the kernel releases its lock, its clients lose their connection, and the next
 process to open the database becomes the owner.
 
@@ -47,12 +48,15 @@ async fn example() -> kvshare::Result<()> {
 | S2 | Cursors with `seek`, `next`, `prev`; history | done |
 | S3 | `Tree`'s administrative operations through the owner | done |
 | S4 | Robustness, a cursor over keys only, documentation | done |
+| S5 | What a review found: how a tree ends, what is too large for a frame, a bounded queue, commits of one client together, where the processes meet, protocol versions, `Tree::transact`, `tracing` | done |
 
 ## Boundaries
 
 - macOS and Linux. Not Windows, not a browser (`with_file_system`), not network file
   systems, not several machines.
 - Tested on macOS only: no test has run on Linux yet.
+- The owner and its clients are one user's processes. Each end of the socket refuses a
+  process of another user; no test covers the refusal, which takes a second user.
 - SurrealKV `=1.4.0`.
 
 ## Mapping to SurrealKV's API
@@ -90,8 +94,11 @@ the transaction sees.
 
 kvshare adds:
 
-- `TreeBuilder::with_run_dir` (where the owners' sockets live, by default `kvshare` in
-  the temporary directory), `with_election_timeout`, `with_call_timeout`;
+- `TreeBuilder::with_run_dir` (where this process puts its socket if it owns the
+  database, see below), `with_election_timeout`, `with_call_timeout`;
+- `Tree::transact` and the trait `Operation`: a transaction run until it is known to
+  have committed once, see Errors;
+- `MAX_ENTRY`: the most a key and its value hold together, 64 MiB;
 - `TreeBuilder::current_owner`: the owner's pid, asked over its socket, without taking
   part in the election;
 - `Tree::is_owner`, `Tree::owner_pid`, `Transaction::is_local`;
@@ -113,6 +120,32 @@ versions each is, and the next page starts next to such an entry. The cursor its
 repeats what SurrealKV's iterators do: a cursor not yet positioned seeks on its first
 move, an exhausted one stays so until a seek, and a history's `limit` is spent by each
 entry a move lands on, kept across a change of direction and renewed by a seek.
+
+## How the processes of one database meet
+
+Only the database's path is shared. The owner binds a socket in its run directory,
+under a name made of a hash of the database's canonical path, and writes the socket's
+path into `<db>/SOCKET`. A process that finds the database locked reads the path there.
+So the processes need not agree on a run directory, nor share an environment: an
+application and a command started from a sandbox or from cron, with another `TMPDIR`,
+find each other.
+
+- The run directory is `kvshare` in `$XDG_RUNTIME_DIR` where that is set, or else
+  `kvshare-<uid>` in the temporary directory; `with_run_dir` names another. A directory
+  that is missing is made for its user only (0700); one that is there is left as it is.
+  A socket's path holds 103 bytes at most, which is why the socket does not lie in the
+  database's directory itself.
+- Each end of the socket asks the system whose process the other end is, and refuses
+  another user's: the owner hangs up before its welcome, a client answers `Handshake`.
+- The owner's welcome names the versions of the protocol it speaks, from the oldest to
+  the newest, and the client's first frame names the newest both speak. This build
+  speaks version 8 only; a later one can go on serving the processes of an older
+  version. A client that shares no version with its owner is `VersionMismatch`.
+
+kvshare tells what it does through `tracing`, under the target `kvshare`: at `info`, a
+process that comes to own the database, one that works through an owner, and an owner
+that handed the database over; at `warn`, an owner that is silent or lost, no owner in
+time, and a client the owner hung up on.
 
 ## Options every process must set alike
 
@@ -146,15 +179,24 @@ kvshare's own:
 - `OwnerLost`: the owner went away during the operation. The next transaction elects a
   new owner.
 - `OwnerSilent`: the owner holds the database but did not answer within the call
-  timeout (5 s unless `with_call_timeout` says otherwise). The request still reaches the
-  owner whole and may still be carried out; the connection stays usable.
+  timeout (5 s unless `with_call_timeout` says otherwise). A request that was sent still
+  reaches the owner whole and may still be carried out; the connection stays usable. A
+  client keeps at most 64 MiB of frames waiting for an owner that reads nothing: a
+  request that finds no room among them within the call timeout is `OwnerSilent` too,
+  and was not sent.
 - `NoOwner`: nobody became the owner, nor answered as one, within the election
   timeout. Opening waits that long for an owner on its way in or out: one that has not
   bound its socket yet, has just died, is stopped and silent at its welcome, or hangs up
   before it while it closes the database.
 - `TooManyTransactions`: a client holds 64 open transactions on its connection already;
   it learns this on the first request of the one too many.
+- `TooLarge`: a key with its value holds more than 64 MiB (`MAX_ENTRY`), or a request
+  or an answer does not fit one frame. Nothing was written or sent, and the transaction
+  works on.
 - `Handshake`, `VersionMismatch`, `OptionsMismatch`: the owner and the client disagree.
+
+`Error` is `#[non_exhaustive]`: kvshare may add errors, so a `match` on it needs an arm
+for the ones it does not name.
 
 **A commit that ends in `OwnerLost` or `OwnerSilent` may have happened or not.** The
 owner may have committed it just before it died or while it did not answer, and a
@@ -173,6 +215,53 @@ A caller that must know reads the keys back in a new transaction before it decid
 can be repeated safely (the same keys and values again); `tests/failover.rs` repeats
 its writes that way.
 
+`Tree::transact` is that loop. It runs an `Operation` until it is known to have
+committed once: `apply` makes the reads and writes, in a new transaction for every
+attempt, and `landed` tells from the database whether the commit of an earlier attempt
+is there, by something `apply` wrote, the operation's name in a key, say. An attempt
+is repeated after a conflict, a write stall, and an owner lost, silent or being
+elected; after a commit whose answer never came, `landed` is asked first.
+
+```rust
+use std::time::Duration;
+
+use kvshare::{Operation, Result, Transaction, Tree};
+
+/// Add `by` to the stock, as the operation named `name`.
+struct Restock {
+    name: Vec<u8>,
+    by: u64,
+}
+
+impl Operation for Restock {
+    type Output = u64;
+
+    async fn apply(&mut self, tx: &mut Transaction) -> Result<u64> {
+        let stock = match tx.get_for_update(b"stock").await? {
+            Some(bytes) => u64::from_le_bytes(bytes.try_into().unwrap()),
+            None => 0,
+        };
+        tx.set(b"stock", &(stock + self.by).to_le_bytes())?;
+        // What `landed` finds: the operation's name, with the stock it left.
+        tx.set(&self.name, &(stock + self.by).to_le_bytes())?;
+        Ok(stock + self.by)
+    }
+
+    async fn landed(&mut self, tx: &Transaction) -> Result<Option<u64>> {
+        let left = tx.get(&self.name).await?;
+        Ok(left.map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap())))
+    }
+}
+
+async fn restock(tree: &Tree) -> Result<u64> {
+    let mut operation = Restock {
+        name: b"op/7f3a".to_vec(),
+        by: 5,
+    };
+    tree.transact(Duration::from_secs(10), &mut operation).await
+}
+```
+
 ## Where kvshare differs from SurrealKV
 
 - Reads, `begin`, opening the tree, the moves of a cursor and `commit` are `async`.
@@ -183,6 +272,15 @@ its writes that way.
   answer in a `Result`: the owner may not answer.
 - A client waits for a checkpoint, a restore, a compaction or an encryption status as
   long as it takes, without the call timeout: they copy, rewrite or read files.
+- A key with its value holds at most 64 MiB (`MAX_ENTRY`), in an owner and in a client
+  alike: what a process may write does not turn on the role it happens to hold.
+- A client's transaction may write more than a frame holds: writes of more than 4 MiB
+  travel to the owner ahead of the transaction's next request. The values of many keys
+  (`get_many`) come from the owner in parts, as a cursor's pages do.
+- A commit that could not be sent, `TooLarge` or no room in time, leaves the
+  transaction open with its writes; SurrealKV closes a transaction at every commit.
+- A tree whose every handle is dropped lets the database go, as SurrealKV's does, on
+  the runtime; `close` waits for it and tells its error.
 - A cursor reads each value of its page unless it reads keys only (`set_keys_only`).
 - Finding an entry again for the next page steps through the versions of its key, so a
   history of a key with very many versions read in small pages reads them repeatedly.
@@ -255,6 +353,25 @@ load average of about 12, so slower than above throughout (medians, p99 in brack
 | reading the values | 0.90 ms (3.8) | 28.9 ms (41.4) |
 | keys only (`set_keys_only`) | 0.09 ms (0.10) | 0.21 ms (0.46) |
 
+### What a client costs its owner, and its owner a client
+
+Through one connection, with `Durability::Immediate` (`tests/handover.rs`): one task
+makes about 130 to 210 commits a second, and eight tasks about 830, which is what
+eight tasks of the owner make. A transaction begins behind the commits of its
+connection only when the client stopped waiting for one of them; before, every begin
+waited, and eight tasks made as many commits as one.
+
+A client's requests are answered on the owner's async threads, so each is kept short:
+a cursor's page and a part of `get_many` hold 256 entries or 1 MiB, and writes travel
+in frames of 4 MiB. While a client read 5000 keys of 4 KiB with one `get_many`, again
+and again, a 1 ms timer in the owner's process fired late by 1.5 ms at p99 and 3 ms at
+most, against 1.5 ms with no client at all; with the whole answer in one frame it had
+been 12 ms and 20 ms.
+
+A client whose owner is stopped keeps at most 64 MiB of frames for it. Of 200 commits
+of 1 MiB made meanwhile, about 64 are sent when the owner resumes and the others were
+`OwnerSilent` and never sent (`tests/processes.rs`); before, all 200 waited in memory.
+
 ### What a change of owner costs
 
 Every change of owner opens SurrealKV in the next owner, and an owner that leaves by
@@ -321,8 +438,8 @@ files again and compacting the tables: `kv-space` shows it with the key never re
 Data that is replaced or removed in no particular order, a code index or threads
 removed one by one, is better kept with no history and with the value log off, which
 `kv-sim` does. Values of hundreds of KiB and more, files above all, are better kept out
-of the database: a value crosses an owner's socket in one frame of at most 64 MiB and
-is held whole in memory on both sides.
+of the database: a key with its value holds at most 64 MiB (`MAX_ENTRY`), crosses an
+owner's socket in one frame and is held whole in memory on both sides.
 
 ## Tests
 
@@ -334,7 +451,8 @@ cargo test
   among them every operation on the whole database, a restore with a transaction open,
   and cursors over keys only.
 - `tests/handover.rs`: the election, hand-over, conflicts, a client's own writes, many
-  tasks of one client, a client that leaves, an owner that crashes, an owner that
+  tasks of one client and their commits together, a client that leaves, an owner that
+  crashes, an owner that
   leaves while it compacts, a client with other options, the bound on open
   transactions.
 - `tests/scan.rs`: cursors over ranges and histories in pages, the same in the owner
@@ -345,12 +463,29 @@ cargo test
   the socket's buffer arriving whole; opening the database while the owner is stopped,
   which waits for it within the election timeout and is `NoOwner` past it; a commit the
   owner was silent about, which the client's next transaction sees; clients killed with
-  SIGKILL while their transactions are open.
+  SIGKILL while their transactions are open; a client that goes on committing while
+  its owner is stopped, whose frames wait only up to their bound.
 - `tests/failover.rs`: writers in several processes while the owner is killed again
   and again; `KVSHARE_FAILOVER_SECONDS` makes it run longer than 6 seconds.
-- Unit tests: frames, endpoints, a write stall across the socket, a client that
-  refuses an owner of another protocol version, another database or other options, and
-  one that elects again when the owner hangs up before its welcome.
+- `tests/lifecycle.rs`: a tree dropped without a close, which lets the database go; a
+  tree closed while its tasks begin transactions, which stays closed; a client's
+  transaction dropped on a thread with no runtime, which is rolled back.
+- `tests/limits.rs`: a client's commit of more than a frame holds; values of many keys
+  that no frame holds, and more keys than one request asks for; an entry over the
+  limit, refused alike in both roles; a request no frame holds, which keeps its
+  transaction's writes.
+- `tests/meeting.rs`: trees with different run directories, which meet through the
+  database's directory; a named run directory, which keeps its permissions; the
+  default one, which is the user's own.
+- `tests/transact.rs`: `Tree::transact` across conflicts, a commit a stopped owner did
+  not answer (applied once), the owner's death, and errors it gives up on.
+- `tests/events.rs`: the `tracing` events of an owner, its client and a hand-over.
+- Unit tests: frames, endpoints and the path of the owner's socket, a write stall
+  across the socket, a client that refuses an owner with no protocol version in common,
+  another database or other options, the version a client and an owner agree on, a
+  client that elects again when the owner hangs up before its welcome, the bound on the
+  frames a client queues, a commit in doubt, and writes sent ahead that the owner
+  could not apply.
 - `tests/sim.rs`: the simulation below; its checks find every fault put into a run made
   by hand, and a run of 30 seconds finds nothing wrong.
 

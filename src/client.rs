@@ -370,11 +370,18 @@ mod tests {
             queued += 1;
             assert!(queued < 100, "the queue takes frames without end");
         }
-        assert_eq!(queued, MAX_QUEUED / (8 << 20), "frames of 8 MiB up to the bound");
+        assert_eq!(
+            queued,
+            MAX_QUEUED / (8 << 20),
+            "frames of 8 MiB up to the bound"
+        );
         let waiting = connection.queued.bytes.load(Ordering::Acquire);
         assert!(waiting <= MAX_QUEUED + MAX_FRAME as usize, "{waiting} wait");
 
-        assert!(!connection.tell(&big, false), "no room without waiting either");
+        assert!(
+            !connection.tell(&big, false),
+            "no room without waiting either"
+        );
         assert!(
             connection.tell(&Request::Rollback { tx: 1 }, true),
             "a rollback is queued whatever waits"
@@ -400,8 +407,11 @@ mod tests {
         let frame = connection
             .frame(&Request::Rollback { tx: 1 })
             .expect("a frame");
-        let callers =
-            || lock(&connection.waiting).as_ref().map(|waiting| waiting.callers.len());
+        let callers = || {
+            lock(&connection.waiting)
+                .as_ref()
+                .map(|waiting| waiting.callers.len())
+        };
         let sent = connection.queue(frame).await.expect("queued");
         assert_eq!(callers(), Some(1));
         drop(sent);

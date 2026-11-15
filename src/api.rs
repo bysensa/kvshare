@@ -514,7 +514,10 @@ impl Tree {
                 _ => return Err(in_doubt.unwrap_or(failed.error)),
             };
             let unanswered = failed.at_commit
-                && matches!(failed.error, Error::OwnerLost(_) | Error::OwnerSilent { .. });
+                && matches!(
+                    failed.error,
+                    Error::OwnerLost(_) | Error::OwnerSilent { .. }
+                );
             let last = if unanswered {
                 in_doubt = Some(failed.error);
                 None
@@ -522,9 +525,7 @@ impl Tree {
                 Some(failed.error)
             };
             if started.elapsed() + pause >= within {
-                return Err(in_doubt
-                    .or(last)
-                    .expect("the attempt failed with an error"));
+                return Err(in_doubt.or(last).expect("the attempt failed with an error"));
             }
             tokio::time::sleep(pause).await;
         }
@@ -546,7 +547,10 @@ impl Tree {
         };
         if in_doubt {
             let unsettled = failed(false, false);
-            let tx = self.begin_with_mode(Mode::ReadOnly).await.map_err(unsettled)?;
+            let tx = self
+                .begin_with_mode(Mode::ReadOnly)
+                .await
+                .map_err(unsettled)?;
             if let Some(value) = operation.landed(&tx).await.map_err(unsettled)? {
                 return Ok(value);
             }
@@ -692,7 +696,12 @@ impl Tree {
                 let deadline = self.inner.deadline();
                 let sent = self
                     .inner
-                    .within(generation, owner_pid, Some(deadline), connection.queue(frame))
+                    .within(
+                        generation,
+                        owner_pid,
+                        Some(deadline),
+                        connection.queue(frame),
+                    )
                     .await?;
                 // Sent in time; an operation that takes long is waited for without one.
                 let deadline = (!long).then_some(deadline);
@@ -759,10 +768,7 @@ pub trait Operation {
 
     /// Read and write in `tx`. Called for every attempt, each time with a new
     /// transaction; what it answers is the call's answer once the commit is known.
-    fn apply(
-        &mut self,
-        tx: &mut Transaction,
-    ) -> impl Future<Output = Result<Self::Output>> + Send;
+    fn apply(&mut self, tx: &mut Transaction) -> impl Future<Output = Result<Self::Output>> + Send;
 
     /// Whether the commit of an earlier attempt is in the database, read in `tx`: the
     /// operation's answer if it is.
@@ -974,7 +980,12 @@ impl Remote {
             let framed = connection.frame(&ahead);
             pending.put_back(ahead.take_writes());
             inner
-                .within(generation, owner_pid, Some(deadline), connection.post(framed?))
+                .within(
+                    generation,
+                    owner_pid,
+                    Some(deadline),
+                    connection.post(framed?),
+                )
                 .await?;
             pending.take_first(count);
         }
@@ -982,7 +993,12 @@ impl Remote {
         let framed = connection.frame(&request);
         pending.put_back(request.take_writes());
         let sent = inner
-            .within(generation, owner_pid, Some(deadline), connection.queue(framed?))
+            .within(
+                generation,
+                owner_pid,
+                Some(deadline),
+                connection.queue(framed?),
+            )
             .await?;
         pending.take();
         Ok((sent, deadline))

@@ -27,7 +27,10 @@ async fn trees_with_different_run_directories_meet() {
         .expect("a tree with another run directory finds the owner");
     assert!(!second.is_owner().await.expect("a role"));
     let tx = second.begin().await.expect("a transaction");
-    assert_eq!(tx.get(b"k").await.expect("a read").as_deref(), Some(&b"v"[..]));
+    assert_eq!(
+        tx.get(b"k").await.expect("a read").as_deref(),
+        Some(&b"v"[..])
+    );
     drop(tx);
 
     first.close().await.expect("the owner leaves");

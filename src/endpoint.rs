@@ -163,7 +163,10 @@ mod tests {
             io::ErrorKind::NotFound
         );
         owner.publish().expect("the path is left");
-        assert_eq!(other.owner_socket().expect("the owner's socket"), owner.socket);
+        assert_eq!(
+            other.owner_socket().expect("the owner's socket"),
+            owner.socket
+        );
         assert_ne!(other.socket, owner.socket);
 
         std::fs::write(owner.pointer(), b"not/absolute").expect("a broken file");
