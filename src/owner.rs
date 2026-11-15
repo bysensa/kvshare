@@ -273,8 +273,19 @@ async fn serve(
                 };
                 Ok(Answer::Got(value))
             }),
-            Request::GetMany { tx, writes, keys } => table.on(tx, writes, |transaction| {
-                many(&keys, |key| transaction.get(key))
+            Request::GetMany {
+                tx,
+                writes,
+                keys,
+                for_update,
+            } => table.on(tx, writes, |transaction| {
+                many(&keys, |key| {
+                    if for_update {
+                        transaction.get_for_update(key)
+                    } else {
+                        transaction.get(key)
+                    }
+                })
             }),
             Request::GetAt {
                 tx,

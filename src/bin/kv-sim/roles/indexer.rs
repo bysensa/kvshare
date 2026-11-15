@@ -2,7 +2,8 @@
 //! again, replacing the facts the file held with the facts it holds now. Facts are kept
 //! by the hash of their content and shared by the files that hold them, with a count of
 //! references; a fact no file refers to any more goes. One transaction changes the
-//! file's facts, the counts and the facts together. A fifth of the facts are large, of 2
+//! file's facts, the counts and the facts together, and reads the counts it changes
+//! for update at once (`get_many_for_update`). A fifth of the facts are large, of 2
 //! to 8 KiB, and one in a hundred very large, of 64 to 192 KiB. After
 //! each commit the indexer finds every fact of the file again with a cursor over keys
 //! only.
@@ -111,8 +112,30 @@ impl Op for IndexOp {
             None => BTreeSet::new(),
         };
         let new: BTreeSet<String> = self.facts.iter().map(|(hash, _)| hash.clone()).collect();
-        for hash in old.difference(&new) {
-            let count = references(tx, hash).await?.saturating_sub(1);
+        // How many files refer to each fact that goes and to each that comes, read for
+        // update at once: one request to the owner, where reading them one by one asks
+        // it once a fact.
+        let going: Vec<&String> = old.difference(&new).collect();
+        let coming: Vec<&(String, Vec<u8>)> = self
+            .facts
+            .iter()
+            .filter(|(hash, _)| !old.contains(hash))
+            .collect();
+        let counted: Vec<Vec<u8>> = going
+            .iter()
+            .map(|hash| keys::references(hash))
+            .chain(coming.iter().map(|(hash, _)| keys::references(hash)))
+            .collect();
+        let mut counts = Vec::with_capacity(counted.len());
+        for found in tx.get_many_for_update(&counted).await? {
+            counts.push(match found {
+                Some(bytes) => keys::decode::<u64>(&bytes).map_err(kvshare::Error::Engine)?,
+                None => 0,
+            });
+        }
+        let (gone, come) = counts.split_at(going.len());
+        for (hash, references) in going.into_iter().zip(gone) {
+            let count = references.saturating_sub(1);
             if count == 0 {
                 tx.delete(keys::references(hash))?;
                 tx.delete(keys::fact(hash))?;
@@ -120,11 +143,8 @@ impl Op for IndexOp {
                 tx.set(keys::references(hash), keys::encode(&count))?;
             }
         }
-        for (hash, body) in &self.facts {
-            if old.contains(hash) {
-                continue;
-            }
-            let count = references(tx, hash).await? + 1;
+        for ((hash, body), references) in coming.into_iter().zip(come) {
+            let count = references + 1;
             tx.set(keys::references(hash), keys::encode(&count))?;
             if count == 1 {
                 let fact = Fact {
@@ -148,12 +168,4 @@ impl Op for IndexOp {
             None => false,
         })
     }
-}
-
-/// How many files refer to a fact, read for update.
-async fn references(tx: &mut Transaction, hash: &str) -> kvshare::Result<u64> {
-    Ok(match tx.get_for_update(keys::references(hash)).await? {
-        Some(bytes) => keys::decode(&bytes).map_err(kvshare::Error::Engine)?,
-        None => 0,
-    })
 }

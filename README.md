@@ -98,6 +98,9 @@ kvshare adds:
   database, see below), `with_election_timeout`, `with_call_timeout`;
 - `Tree::transact` and the trait `Operation`: a transaction run until it is known to
   have committed once, see Errors;
+- `Transaction::get_many_for_update`: many keys read for update at once, each as
+  `get_for_update` reads it. A client asks its owner once for as many keys as a
+  cursor's page holds, where reading them one by one asks once a key;
 - `TreeBuilder::with_max_entry_size`: the most a key and its value hold together,
   64 MiB (`DEFAULT_MAX_ENTRY`) unless set and just under 4 GiB (`LARGEST_MAX_ENTRY`) at
   most; every process of a database sets it alike;
@@ -141,7 +144,7 @@ find each other.
   another user's: the owner hangs up before its welcome, a client answers `Handshake`.
 - The owner's welcome names the versions of the protocol it speaks, from the oldest to
   the newest, and the client's first frame names the newest both speak. This build
-  speaks version 8 only; a later one can go on serving the processes of an older
+  speaks version 9 only; a later one can go on serving the processes of an older
   version. A client that shares no version with its owner is `VersionMismatch`.
 
 kvshare tells what it does through `tracing`, under the target `kvshare`: at `info`, a
@@ -373,6 +376,15 @@ and again, a 1 ms timer in the owner's process fired late by 1.5 ms at p99 and 3
 most, against 1.5 ms with no client at all; with the whole answer in one frame it had
 been 12 ms and 20 ms.
 
+What a call through the owner costs is mostly not the socket: of the 20 µs of a `get`,
+a blocking socket's round trip is about 5 and tokio's about 14, and shared memory with
+the peer woken from sleep would be 2.5 (two threads, 200 000 round trips each). Fewer
+calls give more than another transport would. Reading 250 keys for update through the
+owner takes 3.9 ms one by one and 0.08 ms with `get_many_for_update`
+(`tests/batch.rs`). `kv-sim`'s indexer, which reads the counts of up to 250 facts for
+update in a transaction, took 4 to 7 ms a transaction as a client and 1.3 to 1.5 ms as
+the owner; reading them at once it takes 1.2 to 1.6 ms in either role.
+
 A client whose owner is stopped keeps at most 64 MiB of frames for it. Of 200 commits
 of 1 MiB made meanwhile, about 64 are sent when the owner resumes and the others were
 `OwnerSilent` and never sent (`tests/processes.rs`); before, all 200 waited in memory.
@@ -502,6 +514,9 @@ cargo test
 - `tests/transact.rs`: `Tree::transact` across conflicts, a commit a stopped owner did
   not answer (applied once), the owner's death, and errors it gives up on.
 - `tests/events.rs`: the `tracing` events of an owner, its client and a hand-over.
+- `tests/batch.rs`: many keys read for update at once, which answer as `get_many` and
+  conflict as keys read one by one do, in both roles and in every part of a list longer
+  than one request; an empty key among them; a client's 250 keys in one request.
 - Unit tests: frames, endpoints and the path of the owner's socket, a write stall
   across the socket, a client that refuses an owner with no protocol version in common,
   another database or other options, the version a client and an owner agree on, a
@@ -529,7 +544,8 @@ once, and checks the database against what each process says it did:
   small batches and record metrics into a total all threads share;
 - **readers**, which follow journals with cursors and check what every snapshot must hold;
 - **an indexer** of facts kept by the hash of their content, a fifth of them of 2 to 8
-  KiB and one in a hundred of 64 to 192 KiB, with counts of references;
+  KiB and one in a hundred of 64 to 192 KiB, with counts of references, which it reads
+  for update at once;
 - **a keeper**, which checkpoints, compacts and removes closed threads;
 - **a conductor**, which kills a process every two seconds or so, the owner most of all,
   and stops the owner for one to three seconds every eight.

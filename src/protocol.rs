@@ -44,12 +44,12 @@ use crate::types::{WireDurability, WireMode};
 
 /// The version of the protocol, the newest this build speaks. Bump it when a message
 /// would mean something else.
-pub const VERSION: u32 = 8;
+pub const VERSION: u32 = 9;
 
 /// The oldest version of the protocol this build still speaks. It stays behind
 /// [`VERSION`] for as long as a build answers a process of an older one the way that
 /// process expects.
-pub const OLDEST: u32 = 8;
+pub const OLDEST: u32 = 9;
 
 /// The version to speak with a peer that speaks `oldest` to `newest`: the newest both
 /// speak, if there is one.
@@ -341,10 +341,13 @@ pub(crate) enum Request {
         key: Vec<u8>,
         for_update: bool,
     },
+    /// `get_many`, or each key read as `get_for_update` reads it. The owner answers
+    /// the first of the keys, as many as a page holds bytes.
     GetMany {
         tx: TxId,
         writes: Vec<Write>,
         keys: Vec<Vec<u8>>,
+        for_update: bool,
     },
     GetAt {
         tx: TxId,

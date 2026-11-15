@@ -1035,6 +1035,57 @@ impl Remote {
         pending.take();
         Ok((sent, deadline))
     }
+
+    /// The values of `keys` from the owner: as `get_many` reads them, as `get_many_at`
+    /// does at a `timestamp`, or each `for_update`. They come in parts, as a cursor
+    /// reads in pages: a request asks for as many keys as a page holds entries, and
+    /// the owner answers the first of them, as many as a page holds bytes. So no
+    /// answer outgrows a frame, and no request keeps the owner's thread for long.
+    /// Every part reads the transaction's one snapshot.
+    async fn many(
+        &self,
+        (inner, generation): (&Inner, u64),
+        keys: Vec<Vec<u8>>,
+        timestamp: Option<u64>,
+        for_update: bool,
+    ) -> Result<Vec<Option<Value>>> {
+        let mut values = Vec::with_capacity(keys.len());
+        loop {
+            let asked: Vec<Vec<u8>> = keys[values.len()..]
+                .iter()
+                .take(DEFAULT_PAGE)
+                .cloned()
+                .collect();
+            let wanted = asked.len();
+            let answer = self
+                .ask(inner, generation, |tx, writes| match timestamp {
+                    None => Request::GetMany {
+                        tx,
+                        writes,
+                        keys: asked,
+                        for_update,
+                    },
+                    Some(timestamp) => Request::GetManyAt {
+                        tx,
+                        writes,
+                        keys: asked,
+                        timestamp,
+                    },
+                })
+                .await?;
+            let got = got_many(answer)?;
+            if got.len() > wanted || (got.is_empty() && wanted > 0) {
+                return Err(Error::Handshake(format!(
+                    "the owner answered {} values to {wanted} keys",
+                    got.len()
+                )));
+            }
+            values.extend(got);
+            if values.len() >= keys.len() {
+                return Ok(values);
+            }
+        }
+    }
 }
 
 impl Transaction {
@@ -1359,7 +1410,38 @@ impl Transaction {
             State::Local(transaction) => Ok(transaction.get_many(keys)?),
             State::Remote(remote) => {
                 let keys = keys.iter().map(|key| key.as_slice().to_vec()).collect();
-                self.many(remote, keys, None).await
+                remote
+                    .many((&self.inner, self.generation), keys, None, false)
+                    .await
+            }
+        }
+    }
+
+    /// Read `keys` for update, all at once: each as [`Transaction::get_for_update`]
+    /// reads it, so SurrealKV checks at the commit that no other transaction wrote any
+    /// of them since this one began. The values come in the order of the keys, `None`
+    /// for a key that is missing.
+    ///
+    /// SurrealKV has no such method, and in the owner this is a loop. It is here for a
+    /// client, which asks its owner once for as many keys as a cursor's page holds
+    /// entries, where reading them one by one asks once a key.
+    pub async fn get_many_for_update<K: IntoBytes>(
+        &mut self,
+        keys: &[K],
+    ) -> Result<Vec<Option<Value>>> {
+        match &mut self.state {
+            State::Local(transaction) => {
+                let mut values = Vec::with_capacity(keys.len());
+                for key in keys {
+                    values.push(transaction.get_for_update(key.as_slice())?);
+                }
+                Ok(values)
+            }
+            State::Remote(remote) => {
+                let keys = keys.iter().map(|key| key.as_slice().to_vec()).collect();
+                remote
+                    .many((&self.inner, self.generation), keys, None, true)
+                    .await
             }
         }
     }
@@ -1389,7 +1471,9 @@ impl Transaction {
             State::Local(transaction) => Ok(transaction.get_many_at(keys, timestamp)?),
             State::Remote(remote) => {
                 let keys = keys.iter().map(|key| key.as_slice().to_vec()).collect();
-                self.many(remote, keys, Some(timestamp)).await
+                remote
+                    .many((&self.inner, self.generation), keys, Some(timestamp), false)
+                    .await
             }
         }
     }
@@ -1406,54 +1490,6 @@ impl Transaction {
                     f(at, value.as_deref());
                 }
                 Ok(())
-            }
-        }
-    }
-
-    /// `get_many`, or `get_many_at` with a `timestamp`, through the owner, in parts as
-    /// a cursor reads in pages: a request asks for as many keys as a page holds
-    /// entries, and the owner answers the first of them, as many as a page holds
-    /// bytes. So no answer outgrows a frame, and no request keeps the owner's thread
-    /// for long. Every part reads the transaction's one snapshot.
-    async fn many(
-        &self,
-        remote: &Remote,
-        keys: Vec<Vec<u8>>,
-        timestamp: Option<u64>,
-    ) -> Result<Vec<Option<Value>>> {
-        let mut values = Vec::with_capacity(keys.len());
-        loop {
-            let asked: Vec<Vec<u8>> = keys[values.len()..]
-                .iter()
-                .take(DEFAULT_PAGE)
-                .cloned()
-                .collect();
-            let wanted = asked.len();
-            let answer = remote
-                .ask(&self.inner, self.generation, |tx, writes| match timestamp {
-                    None => Request::GetMany {
-                        tx,
-                        writes,
-                        keys: asked,
-                    },
-                    Some(timestamp) => Request::GetManyAt {
-                        tx,
-                        writes,
-                        keys: asked,
-                        timestamp,
-                    },
-                })
-                .await?;
-            let got = got_many(answer)?;
-            if got.len() > wanted || (got.is_empty() && wanted > 0) {
-                return Err(Error::Handshake(format!(
-                    "the owner answered {} values to {wanted} keys",
-                    got.len()
-                )));
-            }
-            values.extend(got);
-            if values.len() >= keys.len() {
-                return Ok(values);
             }
         }
     }
