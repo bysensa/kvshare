@@ -27,7 +27,7 @@ use surrealkv::{
 use crate::admin::{
     Admin, BackgroundError, CheckpointMetadata, EncryptionStatus, Maintenance, Reply, run_blocking,
 };
-use crate::client::{Connection, Lost};
+use crate::client::{Connection, Lost, Sent};
 use crate::cursor::Cursor;
 use crate::election::{Current, Role, connect};
 use crate::endpoint::Endpoint;
@@ -302,45 +302,46 @@ impl Inner {
         })
     }
 
-    /// Wait for the answer to a request, at most the call timeout.
-    async fn call(
-        &self,
-        generation: u64,
-        owner_pid: u32,
-        call: impl Future<Output = std::result::Result<Answer, Lost>>,
-    ) -> Result<Answer> {
-        self.wait(generation, owner_pid, call, Some(self.call_within))
-            .await
+    /// When a request made now gives up on the owner: the call timeout from now. The
+    /// wait for room among the frames to write and the wait for the answer share it.
+    fn deadline(&self) -> tokio::time::Instant {
+        tokio::time::Instant::now() + self.call_within
     }
 
-    /// Wait for the answer to a request, at most `within` if it is set; a request the
-    /// owner never answered forgets the owner, and a refusal becomes the error it names.
-    async fn wait(
+    /// Wait for `step`, a part of a request on the owner's connection, until
+    /// `deadline` if there is one. An owner that takes longer is silent; one whose
+    /// connection ended is lost, and forgotten.
+    async fn within<T>(
         &self,
         generation: u64,
         owner_pid: u32,
-        call: impl Future<Output = std::result::Result<Answer, Lost>>,
-        within: Option<Duration>,
-    ) -> Result<Answer> {
-        let answered = match within {
-            Some(within) => {
-                tokio::time::timeout(within, call)
-                    .await
-                    .map_err(|_| Error::OwnerSilent {
-                        pid: owner_pid,
-                        waited: within,
-                    })?
-            }
-            None => call.await,
+        deadline: Option<tokio::time::Instant>,
+        step: impl Future<Output = std::result::Result<T, Lost>>,
+    ) -> Result<T> {
+        let done = match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, step)
+                .await
+                .map_err(|_| Error::OwnerSilent {
+                    pid: owner_pid,
+                    waited: self.call_within,
+                })?,
+            None => step.await,
         };
-        match answered {
+        match done {
+            Ok(done) => Ok(done),
             Err(Lost(reason)) => {
                 self.forget(generation).await;
                 Err(Error::OwnerLost(reason))
             }
-            Ok(Answer::Failed(refusal)) => Err(refusal.into()),
-            Ok(answer) => Ok(answer),
         }
+    }
+}
+
+/// The owner's answer, a refusal as the error it names.
+fn accepted(answer: Answer) -> Result<Answer> {
+    match answer {
+        Answer::Failed(refusal) => Err(refusal.into()),
+        answer => Ok(answer),
     }
 }
 
@@ -377,10 +378,13 @@ impl Tree {
                     mode: wire_mode,
                     durability: WireDurability::Eventual,
                 };
-                if let Err(Lost(reason)) = connection.tell(&begin) {
-                    self.inner.forget(generation).await;
-                    return Err(Error::OwnerLost(reason));
-                }
+                // It waits for room among the frames to write like any request: an
+                // owner that reads nothing is silent to a begin too, once enough waits.
+                let frame = connection.frame(&begin)?;
+                let deadline = Some(self.inner.deadline());
+                self.inner
+                    .within(generation, owner_pid, deadline, connection.post(frame))
+                    .await?;
                 let remote = Remote {
                     connection,
                     owner_pid,
@@ -564,9 +568,20 @@ impl Tree {
                 owner_pid,
                 generation,
             } => {
-                let within = (!admin.takes_long()).then_some(self.inner.call_within);
-                let call = connection.call(connection.frame(&Request::Admin(admin))?);
-                match self.inner.wait(generation, owner_pid, call, within).await? {
+                let long = admin.takes_long();
+                let frame = connection.frame(&Request::Admin(admin))?;
+                let deadline = self.inner.deadline();
+                let sent = self
+                    .inner
+                    .within(generation, owner_pid, Some(deadline), connection.queue(frame))
+                    .await?;
+                // Sent in time; an operation that takes long is waited for without one.
+                let deadline = (!long).then_some(deadline);
+                let answer = self
+                    .inner
+                    .within(generation, owner_pid, deadline, sent.answer())
+                    .await?;
+                match accepted(answer)? {
                     Answer::Admin(reply) => Ok(reply),
                     other => Err(out_of_turn(other)),
                 }
@@ -631,6 +646,24 @@ impl Pending {
         writes.append(&mut self.writes);
         self.writes = writes;
     }
+
+    /// How many of the first writes one frame sent ahead takes: as many as hold
+    /// [`WRITES_AHEAD`] together, and one at least.
+    fn share(&self) -> usize {
+        let mut bytes = 0;
+        let fitting = self.writes.iter().take_while(|write| {
+            bytes += write.bytes();
+            bytes <= WRITES_AHEAD
+        });
+        fitting.count().max(1)
+    }
+
+    /// Take the first `count` writes.
+    fn take_first(&mut self, count: usize) -> Vec<Write> {
+        let first: Vec<Write> = self.writes.drain(..count).collect();
+        self.bytes -= first.iter().map(Write::bytes).sum::<usize>();
+        first
+    }
 }
 
 /// Refuse an entry that holds more than [`MAX_ENTRY`] bytes. In a client it would not
@@ -685,9 +718,10 @@ impl Remote {
                 tx: self.id,
                 writes: pending.take(),
             };
-            // A connection that is gone takes nothing: the writes stay, and the
-            // transaction's next request says the owner is lost.
-            if self.connection.tell(&ahead).is_err() {
+            // With no room among the frames to write, or no connection, the writes
+            // stay with the transaction: its next request sends them ahead, waiting
+            // for room, or says what became of the owner.
+            if !self.connection.tell(&ahead, false) {
                 pending.put_back(ahead.take_writes());
             }
         }
@@ -709,20 +743,58 @@ impl Remote {
         // The lock is held until the answer: a read that took no writes must not
         // overtake, on the socket, the read that took them.
         let mut pending = self.pending.lock().await;
-        let mut request = request(self.id, pending.take());
-        // A request that no frame holds is not sent, and the writes it would have
-        // carried stay the transaction's.
-        let frame = match self.connection.frame(&request) {
-            Ok(frame) => frame,
-            Err(unframed) => {
-                pending.put_back(request.take_writes());
-                return Err(unframed.into());
-            }
-        };
-        drop(request);
-        inner
-            .call(generation, self.owner_pid, self.connection.call(frame))
-            .await
+        let (sent, deadline) = Self::submit(
+            &self.connection,
+            (self.id, self.owner_pid),
+            (inner, generation),
+            &mut pending,
+            request,
+        )
+        .await?;
+        let answer = inner
+            .within(generation, self.owner_pid, Some(deadline), sent.answer())
+            .await?;
+        accepted(answer)
+    }
+
+    /// Queue the request that `build` makes of the writes transaction `tx` kept, on
+    /// `connection` to the owner `owner_pid`; the wait for its answer, and when to give
+    /// up on it.
+    ///
+    /// The writes stay in `pending` until the frame that carries them is queued: a
+    /// request that no frame holds, one that finds no room among the frames to write
+    /// in time, and one whose caller gives up first all leave the transaction whole.
+    /// What the transaction kept beyond one request's share, because there was no
+    /// room when it was written, goes ahead first.
+    async fn submit<'c>(
+        connection: &'c Connection,
+        (tx, owner_pid): (TxId, u32),
+        (inner, generation): (&Inner, u64),
+        pending: &mut Pending,
+        build: impl FnOnce(TxId, Vec<Write>) -> Request,
+    ) -> Result<(Sent<'c>, tokio::time::Instant)> {
+        let deadline = inner.deadline();
+        while pending.bytes > WRITES_AHEAD && pending.writes.len() > 1 {
+            let count = pending.share();
+            let mut ahead = Request::Writes {
+                tx,
+                writes: pending.take_first(count),
+            };
+            let framed = connection.frame(&ahead);
+            pending.put_back(ahead.take_writes());
+            inner
+                .within(generation, owner_pid, Some(deadline), connection.post(framed?))
+                .await?;
+            pending.take_first(count);
+        }
+        let mut request = build(tx, pending.take());
+        let framed = connection.frame(&request);
+        pending.put_back(request.take_writes());
+        let sent = inner
+            .within(generation, owner_pid, Some(deadline), connection.queue(framed?))
+            .await?;
+        pending.take();
+        Ok((sent, deadline))
     }
 }
 
@@ -1209,34 +1281,38 @@ impl Transaction {
         match &mut self.state {
             State::Local(transaction) => Ok(transaction.commit().await?),
             State::Remote(remote) => {
-                // What SurrealKV checks before it commits; the transaction is closed
-                // from then on, whatever the commit's outcome.
+                // What SurrealKV checks before it commits.
                 if remote.closed {
                     return Err(Error::TransactionClosed);
                 }
                 if !remote.mode.mutable() {
                     return Err(Error::TransactionReadOnly);
                 }
-                // Refused before the transaction closes, so that dropping it still rolls
-                // it back in the owner.
+                // A commit that is refused here, or that cannot be sent, leaves the
+                // transaction open with its writes: dropping it still rolls it back in
+                // the owner.
                 let durability = WireDurability::of(remote.durability)?;
-                let mut request = Request::Commit {
-                    tx: remote.id,
-                    writes: remote.pending.get_mut().take(),
-                    durability,
-                };
-                // A commit that no frame holds is not sent either: the transaction
-                // stays open, with its writes.
-                let frame = match remote.connection.frame(&request) {
-                    Ok(frame) => frame,
-                    Err(unframed) => {
-                        remote.pending.get_mut().put_back(request.take_writes());
-                        return Err(unframed.into());
-                    }
-                };
+                let connection = Arc::clone(&remote.connection);
+                let mut pending = remote.pending.lock().await;
+                let (sent, deadline) = Remote::submit(
+                    &connection,
+                    (remote.id, remote.owner_pid),
+                    (inner, generation),
+                    &mut pending,
+                    |tx, writes| Request::Commit {
+                        tx,
+                        writes,
+                        durability,
+                    },
+                )
+                .await?;
+                drop(pending);
+                // Sent: the transaction is closed from here on, whatever the outcome.
                 remote.closed = true;
-                let call = remote.connection.call(frame);
-                match inner.call(generation, remote.owner_pid, call).await? {
+                let answer = inner
+                    .within(generation, remote.owner_pid, Some(deadline), sent.answer())
+                    .await?;
+                match accepted(answer)? {
                     Answer::Committed => Ok(()),
                     other => Err(out_of_turn(other)),
                 }
@@ -1306,7 +1382,9 @@ impl Drop for Transaction {
 /// Roll the transaction back in the owner without waiting, from whatever thread drops
 /// it. An owner that is gone has rolled it back already.
 fn end_in_owner(remote: &Remote) {
-    let _ = remote.connection.tell(&Request::Rollback { tx: remote.id });
+    remote
+        .connection
+        .tell(&Request::Rollback { tx: remote.id }, true);
 }
 
 fn got(answer: Answer) -> Result<Option<Value>> {

@@ -5,20 +5,30 @@
 //! them. A caller that stops waiting, on a timeout or because its future is dropped,
 //! leaves its frame to be written whole: a frame cut short would break the connection
 //! for every task of the process.
+//!
+//! The frames that wait for the writer are bounded. An owner that is stopped reads
+//! nothing, and a client that goes on asking would otherwise keep every request in
+//! memory until the owner resumes. A frame is queued while fewer than [`MAX_QUEUED`]
+//! bytes wait; one that finds no room waits for it, which its caller bounds with the
+//! call timeout, and is not sent if the caller gives up first.
 
 use std::collections::HashMap;
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use tokio::io::{AsyncWriteExt as _, BufReader};
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::protocol::{Answer, Request, RequestId, Unframed, Welcome, encode_frame, read_frame};
+
+/// How many bytes of frames may wait for the writer before another frame has to wait
+/// for room. A frame is taken while fewer wait, so at most this and one frame do.
+pub const MAX_QUEUED: usize = 64 << 20;
 
 /// Why a request got no answer: the connection to the owner is gone.
 #[derive(Debug)]
@@ -36,14 +46,48 @@ type Callers = HashMap<RequestId, oneshot::Sender<Answer>>;
 /// The callers waiting for an answer; `None` once the connection ended.
 type Waiting = Mutex<Option<Callers>>;
 
+/// The frames queued for the writer and not written yet.
+#[derive(Default)]
+struct Queued {
+    bytes: AtomicUsize,
+    /// Told whenever the writer has written a frame, and when the connection ends.
+    written: Notify,
+}
+
 /// A connection to the owner.
 pub struct Connection {
     /// Frames to write, in their order.
     frames: mpsc::UnboundedSender<Vec<u8>>,
+    queued: Arc<Queued>,
     waiting: Arc<Waiting>,
     next: AtomicU64,
     reader: JoinHandle<()>,
     writer: JoinHandle<()>,
+}
+
+/// The wait for the answer to a frame that was queued. Dropping it stops the wait, not
+/// the request: its frame reaches the owner whole.
+pub struct Sent<'c> {
+    connection: &'c Connection,
+    id: RequestId,
+    answered: oneshot::Receiver<Answer>,
+}
+
+impl Sent<'_> {
+    /// The owner's answer, or the end of the connection.
+    pub async fn answer(mut self) -> Result<Answer, Lost> {
+        (&mut self.answered).await.map_err(|_| ended())
+    }
+}
+
+impl Drop for Sent<'_> {
+    fn drop(&mut self) {
+        // A caller that stopped waiting leaves no entry behind for an answer that an
+        // owner stopped for good never sends.
+        if let Some(waiting) = lock(&self.connection.waiting).as_mut() {
+            waiting.remove(&self.id);
+        }
+    }
 }
 
 impl Connection {
@@ -56,11 +100,22 @@ impl Connection {
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "no welcome in time"))??;
         let waiting: Arc<Waiting> = Arc::new(Mutex::new(Some(HashMap::new())));
-        let (frames, queued) = mpsc::unbounded_channel();
+        let queued = Arc::new(Queued::default());
+        let (frames, to_write) = mpsc::unbounded_channel();
         let connection = Connection {
             frames,
-            reader: tokio::spawn(read_answers(reader, Arc::clone(&waiting))),
-            writer: tokio::spawn(write_frames(write, queued, Arc::clone(&waiting))),
+            reader: tokio::spawn(read_answers(
+                reader,
+                Arc::clone(&waiting),
+                Arc::clone(&queued),
+            )),
+            writer: tokio::spawn(write_frames(
+                write,
+                to_write,
+                Arc::clone(&waiting),
+                Arc::clone(&queued),
+            )),
+            queued,
             waiting,
             next: AtomicU64::new(1),
         };
@@ -77,30 +132,96 @@ impl Connection {
         })
     }
 
-    /// Send `frame` and wait for its answer. Dropping the returned future stops the
-    /// wait, not the request: it reaches the owner whole.
-    pub async fn call(&self, frame: Frame) -> Result<Answer, Lost> {
+    /// Queue `frame` once the frames before it leave room, and hand back the wait for
+    /// its answer. A caller bounds the wait for room with its timeout: nothing is sent
+    /// if the returned future is dropped before it ends.
+    pub async fn queue(&self, frame: Frame) -> Result<Sent<'_>, Lost> {
+        self.room(frame.bytes.len()).await?;
+        // Room is taken: from here to the queue nothing waits, so a caller that gives
+        // up cannot leave the room taken and the frame unsent.
         let (answer, answered) = oneshot::channel();
         match lock(&self.waiting).as_mut() {
             Some(waiting) => waiting.insert(frame.id, answer),
-            None => return Err(ended()),
-        };
-        if self.frames.send(frame.bytes).is_err() {
-            if let Some(waiting) = lock(&self.waiting).as_mut() {
-                waiting.remove(&frame.id);
+            None => {
+                self.give_back(frame.bytes.len());
+                return Err(ended());
             }
-            return Err(ended());
-        }
-        answered.await.map_err(|_| ended())
+        };
+        let sent = Sent {
+            connection: self,
+            id: frame.id,
+            answered,
+        };
+        self.push(frame.bytes)?;
+        Ok(sent)
     }
 
-    /// Send `request`, which has no answer, without waiting. It needs no runtime: a
+    /// Queue `frame`, which has no answer, once the frames before it leave room.
+    pub async fn post(&self, frame: Frame) -> Result<(), Lost> {
+        self.room(frame.bytes.len()).await?;
+        self.push(frame.bytes)
+    }
+
+    /// Queue `request`, which has no answer, without waiting, and say whether it was
+    /// queued: not when the connection ended, and not when as much as may wait is
+    /// waiting, unless the request goes `whatever_waits`. It needs no runtime: a
     /// transaction dropped on any thread rolls back through it.
-    pub fn tell(&self, request: &Request) -> Result<(), Lost> {
-        let frame = self
-            .frame(request)
-            .map_err(|unframed| Lost(io::Error::from(unframed).to_string()))?;
-        self.frames.send(frame.bytes).map_err(|_| ended())
+    pub fn tell(&self, request: &Request, whatever_waits: bool) -> bool {
+        let Ok(frame) = self.frame(request) else {
+            return false;
+        };
+        if whatever_waits {
+            self.queued
+                .bytes
+                .fetch_add(frame.bytes.len(), Ordering::AcqRel);
+        } else if !self.reserve(frame.bytes.len()) {
+            return false;
+        }
+        self.push(frame.bytes).is_ok()
+    }
+
+    /// Wait until fewer than [`MAX_QUEUED`] bytes wait for the writer, and count
+    /// `bytes` more among them.
+    async fn room(&self, bytes: usize) -> Result<(), Lost> {
+        loop {
+            // Listening before the look, so that a frame written between the look and
+            // the wait is not missed.
+            let written = self.queued.written.notified();
+            tokio::pin!(written);
+            written.as_mut().enable();
+            if lock(&self.waiting).is_none() {
+                return Err(ended());
+            }
+            if self.reserve(bytes) {
+                return Ok(());
+            }
+            written.await;
+        }
+    }
+
+    /// Count `bytes` more among those that wait, if fewer than [`MAX_QUEUED`] do.
+    fn reserve(&self, bytes: usize) -> bool {
+        self.queued
+            .bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |waiting| {
+                (waiting < MAX_QUEUED).then_some(waiting + bytes)
+            })
+            .is_ok()
+    }
+
+    /// Take back the room of `bytes` that will not be queued after all.
+    fn give_back(&self, bytes: usize) {
+        self.queued.bytes.fetch_sub(bytes, Ordering::AcqRel);
+        self.queued.written.notify_waiters();
+    }
+
+    /// Hand a frame whose room is taken to the writer.
+    fn push(&self, frame: Vec<u8>) -> Result<(), Lost> {
+        let bytes = frame.len();
+        self.frames.send(frame).map_err(|_| {
+            self.give_back(bytes);
+            ended()
+        })
     }
 }
 
@@ -117,7 +238,11 @@ fn lock(waiting: &Waiting) -> MutexGuard<'_, Option<Callers>> {
 
 /// Hand each answer to the caller waiting for its id until the connection ends, then
 /// wake every caller still waiting with the end.
-async fn read_answers(mut reader: BufReader<OwnedReadHalf>, waiting: Arc<Waiting>) {
+async fn read_answers(
+    mut reader: BufReader<OwnedReadHalf>,
+    waiting: Arc<Waiting>,
+    queued: Arc<Queued>,
+) {
     while let Ok((id, answer)) = read_frame::<_, (RequestId, Answer)>(&mut reader).await {
         let caller = lock(&waiting)
             .as_mut()
@@ -126,25 +251,115 @@ async fn read_answers(mut reader: BufReader<OwnedReadHalf>, waiting: Arc<Waiting
             let _ = caller.send(answer);
         }
     }
-    // Dropping the senders ends every wait with an error.
+    // Dropping the senders ends every wait with an error; a caller waiting for room
+    // learns of the end too.
     lock(&waiting).take();
+    queued.written.notify_waiters();
 }
 
 /// Write each queued frame whole, in its order, until the queue closes. A write that
 /// fails ends the connection: every caller still waiting learns it is lost.
 async fn write_frames(
     mut writer: OwnedWriteHalf,
-    mut queued: mpsc::UnboundedReceiver<Vec<u8>>,
+    mut frames: mpsc::UnboundedReceiver<Vec<u8>>,
     waiting: Arc<Waiting>,
+    queued: Arc<Queued>,
 ) {
-    while let Some(frame) = queued.recv().await {
-        if writer.write_all(&frame).await.is_err() {
+    while let Some(frame) = frames.recv().await {
+        let written = writer.write_all(&frame).await;
+        queued.bytes.fetch_sub(frame.len(), Ordering::AcqRel);
+        if written.is_err() {
             lock(&waiting).take();
+            queued.written.notify_waiters();
             return;
         }
+        queued.written.notify_waiters();
     }
 }
 
 fn ended() -> Lost {
     Lost("the connection to the owner ended".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::AsyncReadExt as _;
+
+    use super::*;
+    use crate::protocol::{MAX_FRAME, VERSION, Write, write_frame};
+
+    /// A connection to a peer that welcomes it and then reads only when told to.
+    async fn connection() -> (Connection, UnixStream) {
+        let (ours, mut theirs) = UnixStream::pair().expect("a pair of sockets");
+        let welcome = Welcome {
+            version: VERSION,
+            db: "/nowhere".into(),
+            owner_pid: 1,
+            fingerprint: [0; 32],
+        };
+        write_frame(&mut theirs, &welcome).await.expect("a welcome");
+        let (connection, _) = Connection::open(ours, Duration::from_secs(1))
+            .await
+            .expect("a connection");
+        (connection, theirs)
+    }
+
+    /// Frames for an owner that reads nothing wait only up to the bound: the next one
+    /// waits for room and is not sent when its caller gives up. A rollback is queued
+    /// whatever waits. Once the owner reads, there is room again.
+    #[tokio::test]
+    async fn frames_wait_for_room_while_the_owner_reads_nothing() {
+        let (connection, mut theirs) = connection().await;
+        let big = Request::Writes {
+            tx: 1,
+            writes: vec![Write::Set {
+                key: b"k".to_vec(),
+                value: vec![0; 8 << 20],
+            }],
+        };
+        let mut queued = 0;
+        loop {
+            let frame = connection.frame(&big).expect("a frame");
+            match tokio::time::timeout(Duration::from_millis(50), connection.post(frame)).await {
+                Ok(posted) => posted.expect("the connection lives"),
+                Err(_) => break,
+            }
+            queued += 1;
+            assert!(queued < 100, "the queue takes frames without end");
+        }
+        assert_eq!(queued, MAX_QUEUED / (8 << 20), "frames of 8 MiB up to the bound");
+        let waiting = connection.queued.bytes.load(Ordering::Acquire);
+        assert!(waiting <= MAX_QUEUED + MAX_FRAME as usize, "{waiting} wait");
+
+        assert!(!connection.tell(&big, false), "no room without waiting either");
+        assert!(
+            connection.tell(&Request::Rollback { tx: 1 }, true),
+            "a rollback is queued whatever waits"
+        );
+
+        let reading = tokio::spawn(async move {
+            let mut sink = vec![0u8; 1 << 20];
+            while theirs.read(&mut sink).await.is_ok_and(|read| read > 0) {}
+        });
+        let frame = connection.frame(&big).expect("a frame");
+        tokio::time::timeout(Duration::from_secs(10), connection.post(frame))
+            .await
+            .expect("room once the owner reads")
+            .expect("the connection lives");
+        reading.abort();
+    }
+
+    /// A caller that stops waiting for an answer leaves nothing behind in the table of
+    /// callers.
+    #[tokio::test]
+    async fn a_caller_that_gives_up_leaves_no_entry() {
+        let (connection, _theirs) = connection().await;
+        let frame = connection
+            .frame(&Request::Rollback { tx: 1 })
+            .expect("a frame");
+        let reply = connection.queue(frame).await.expect("queued");
+        assert_eq!(lock(&connection.waiting).as_ref().map(HashMap::len), Some(1));
+        drop(reply);
+        assert_eq!(lock(&connection.waiting).as_ref().map(HashMap::len), Some(0));
+    }
 }

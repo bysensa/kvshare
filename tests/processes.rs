@@ -330,3 +330,76 @@ async fn clients_killed_in_their_transactions_leave_nothing_behind() {
     owner.close().await.expect("the owner closes");
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// How many keys from `q` up to `r` the database holds, as `tree` sees it.
+async fn written(tree: &kvshare::Tree) -> kvshare::Result<usize> {
+    let tx = tree.begin().await?;
+    let mut cursor = tx.range(b"q".as_slice(), b"r".as_slice())?;
+    cursor.set_keys_only(true);
+    let mut count = 0;
+    while cursor.next().await? {
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// A client that goes on committing while its owner is stopped does not keep every
+/// request in memory for the day the owner resumes. Its frames wait for the socket
+/// only up to a bound; a request that finds no room within the call timeout is
+/// `OwnerSilent` and was not sent. So of 200 commits of 1 MiB made while the owner was
+/// stopped, only those that found room reach it once it resumes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stopped_owner_does_not_fill_the_clients_memory() {
+    let base = base("queue");
+    let (db, run) = (base.join("db"), base.join("run"));
+    let (mut owner, said) = worker(&["serve", path(&db), path(&run)]).await;
+    assert_eq!(said, "owner", "the worker owns the database");
+    let pid = owner.id().expect("a running owner");
+    let open = |call: Duration| {
+        TreeBuilder::new()
+            .with_path(db.clone())
+            .with_versioning(true, 0)
+            .with_run_dir(run.clone())
+            .with_call_timeout(call)
+            .build()
+    };
+    let client = open(Duration::from_millis(50)).await.expect("the client");
+    let watcher = open(Duration::from_secs(30)).await.expect("a second client");
+
+    signal("STOP", pid).await;
+    let value = vec![7u8; 1 << 20];
+    for n in 0..200u32 {
+        // A transaction that could not even begin was not sent either.
+        let Ok(mut tx) = client.begin().await else {
+            continue;
+        };
+        tx.set(format!("q{n:03}").into_bytes(), &value)
+            .expect("a write");
+        match tx.commit().await {
+            Err(Error::OwnerSilent { .. }) => {}
+            other => panic!("a stopped owner should be silent, got {other:?}"),
+        }
+    }
+    signal("CONT", pid).await;
+
+    // The owner works through what the client had queued; wait until it is done.
+    let mut landed = written(&watcher).await.expect("the owner answers again");
+    loop {
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let now = written(&watcher).await.expect("the owner answers");
+        if now == landed {
+            break;
+        }
+        landed = now;
+    }
+    assert!(
+        (1..100).contains(&landed),
+        "{landed} of the 200 commits reached the owner; the client's queue holds about 64 MiB"
+    );
+
+    drop(client);
+    drop(watcher);
+    owner.start_kill().expect("SIGKILL to the owner");
+    owner.wait().await.expect("the owner exits");
+    let _ = std::fs::remove_dir_all(&base);
+}
