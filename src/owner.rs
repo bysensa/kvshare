@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,7 +14,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::admin::{Maintenance, run_blocking};
-use crate::endpoint::Endpoint;
+use crate::endpoint::{Endpoint, same_user};
 use crate::error::KvError;
 use crate::exec::{apply, page};
 use crate::protocol::{
@@ -32,12 +32,16 @@ pub(crate) struct Owner {
     /// Held by every operation on the whole database while it runs; see [`Maintenance`].
     maintenance: Maintenance,
     socket: PathBuf,
+    /// The file in the database's directory that names the socket.
+    pointer: PathBuf,
     accept: JoinHandle<()>,
 }
 
 impl Owner {
     /// Serve `tree`, which this process has just opened, on the socket of `endpoint`,
-    /// telling each client the `fingerprint` of the options it opened the tree with.
+    /// to the processes of the user `uid`, telling each client the `fingerprint` of
+    /// the options it opened the tree with; and leave the socket's path in the
+    /// database's directory for them.
     ///
     /// Only the holder of the database's lock calls this, so a socket file found at
     /// the path was left by an owner that is gone, and it is removed without asking.
@@ -46,10 +50,16 @@ impl Owner {
         tree: Tree,
         endpoint: &Endpoint,
         fingerprint: [u8; 32],
+        uid: u32,
     ) -> io::Result<Owner> {
         if let Some(dir) = endpoint.socket.parent() {
-            std::fs::create_dir_all(dir)?;
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+            // A directory made here is for this user only. One that is there already
+            // is the caller's and stays as it is: who may be served is looked at on
+            // every connection.
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(dir)?;
         }
         match std::fs::remove_file(&endpoint.socket) {
             Ok(()) => {}
@@ -57,6 +67,7 @@ impl Owner {
             Err(error) => return Err(error),
         }
         let listener = UnixListener::bind(&endpoint.socket)?;
+        endpoint.publish()?;
         let welcome = Arc::new(Welcome {
             version: VERSION,
             db: endpoint.db.clone(),
@@ -67,6 +78,7 @@ impl Owner {
         let maintenance = Maintenance::default();
         let accept = tokio::spawn(accept(
             listener,
+            uid,
             Arc::clone(&tree),
             Arc::clone(&maintenance),
             welcome,
@@ -75,6 +87,7 @@ impl Owner {
             tree,
             maintenance,
             socket: endpoint.socket.clone(),
+            pointer: endpoint.pointer(),
             accept,
         })
     }
@@ -109,6 +122,8 @@ impl Owner {
         self.accept.abort();
         let _ = (&mut self.accept).await;
         let _quiet = self.maintenance.write().await;
+        // Removed while the lock is still held: the next owner's are its own.
+        let _ = std::fs::remove_file(&self.pointer);
         let _ = std::fs::remove_file(&self.socket);
         self.tree.close().await
     }
@@ -125,10 +140,12 @@ impl Drop for Owner {
     }
 }
 
-/// Take connections until the task is aborted; each connection is served by a task
-/// of its own, which the set aborts when it is dropped.
+/// Take the connections of the processes of the user `uid` until the task is aborted;
+/// each connection is served by a task of its own, which the set aborts when it is
+/// dropped. Another user's process is hung up on before it is told anything.
 async fn accept(
     listener: UnixListener,
+    uid: u32,
     tree: Arc<Tree>,
     maintenance: Maintenance,
     welcome: Arc<Welcome>,
@@ -137,6 +154,9 @@ async fn accept(
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
+                if same_user(&stream, uid, "a client").is_err() {
+                    continue;
+                }
                 connections.spawn(serve(
                     stream,
                     Arc::clone(&tree),

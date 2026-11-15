@@ -30,7 +30,7 @@ use crate::admin::{
 use crate::client::{Connection, Lost, Sent};
 use crate::cursor::Cursor;
 use crate::election::{Current, Role, connect};
-use crate::endpoint::Endpoint;
+use crate::endpoint::{self, Endpoint};
 use crate::error::{Error, Result};
 use crate::exec::{open, page};
 use crate::protocol::{
@@ -43,7 +43,9 @@ use crate::types::{KeyRange, ReadOptions, WireDurability, WireMode, fingerprint}
 /// owner.
 pub struct TreeBuilder {
     options: Options,
-    run_dir: PathBuf,
+    /// Where this process puts its socket if it owns the database; the default of its
+    /// environment when none is named.
+    run_dir: Option<PathBuf>,
     elect_within: Duration,
     call_within: Duration,
 }
@@ -62,7 +64,7 @@ impl TreeBuilder {
     pub fn with_options(options: Options) -> Self {
         TreeBuilder {
             options,
-            run_dir: std::env::temp_dir().join("kvshare"),
+            run_dir: None,
             elect_within: Duration::from_secs(5),
             call_within: Duration::from_secs(5),
         }
@@ -177,11 +179,27 @@ impl TreeBuilder {
         self
     }
 
-    /// The directory of the owners' sockets; every process of one database must name
-    /// the same one. By default `kvshare` in the system's temporary directory.
+    /// The directory this process puts its socket in when it owns the database. The
+    /// processes of one database need not name the same one: the owner leaves the path
+    /// of its socket in the database's directory. A directory that is missing is made
+    /// for this user only; one that is there is left as it is. By default `kvshare` in
+    /// the user's runtime directory (`$XDG_RUNTIME_DIR`), or `kvshare-<uid>` in the
+    /// temporary directory. A socket's path holds 103 bytes at most.
     pub fn with_run_dir(mut self, run_dir: PathBuf) -> Self {
-        self.run_dir = run_dir;
+        self.run_dir = Some(run_dir);
         self
+    }
+
+    /// This builder's database, with the socket this process would serve it on, and
+    /// the user this process runs as.
+    fn endpoint(&self) -> Result<(Endpoint, u32)> {
+        let uid = endpoint::uid().map_err(Error::Io)?;
+        let run_dir = match &self.run_dir {
+            Some(run_dir) => run_dir.clone(),
+            None => endpoint::default_run_dir(uid),
+        };
+        let endpoint = Endpoint::new(&self.options.path, &run_dir).map_err(Error::Io)?;
+        Ok((endpoint, uid))
     }
 
     /// How long opening may wait for an owner to answer or for the database to be free.
@@ -198,9 +216,10 @@ impl TreeBuilder {
 
     /// Open the tree: own the database if it is free, or work through its owner.
     pub async fn build(self) -> Result<Tree> {
-        let endpoint = Endpoint::new(&self.options.path, &self.run_dir).map_err(Error::Io)?;
+        let (endpoint, uid) = self.endpoint()?;
         let inner = Arc::new(Inner {
             endpoint,
+            uid,
             fingerprint: fingerprint(&self.options),
             options: self.options,
             elect_within: self.elect_within,
@@ -234,15 +253,16 @@ impl TreeBuilder {
 
     /// The pid of the process that owns this builder's database now, asked over its
     /// socket, without taking part in the election. No owner to ask is an `Error::Io`:
-    /// `NotFound` or `ConnectionRefused` with no socket or none listening, `TimedOut`
-    /// for an owner silent past the call timeout, `UnexpectedEof` for one going away.
+    /// `NotFound` or `ConnectionRefused` with no socket named or none listening,
+    /// `TimedOut` for an owner silent past the call timeout, `UnexpectedEof` for one
+    /// going away. Must be called on a Tokio runtime.
     ///
     /// SurrealKV's lock file is no witness: every process that tries to open the
     /// database truncates it before it tries the lock, which erases the owner's pid.
     pub async fn current_owner(&self) -> Result<u32> {
-        let endpoint = Endpoint::new(&self.options.path, &self.run_dir).map_err(Error::Io)?;
-        let (_, owner_pid) =
-            connect(&endpoint, fingerprint(&self.options), self.call_within).await?;
+        let (endpoint, uid) = self.endpoint()?;
+        let within = self.call_within;
+        let (_, owner_pid) = connect(&endpoint, fingerprint(&self.options), uid, within).await?;
         Ok(owner_pid)
     }
 }
@@ -250,6 +270,8 @@ impl TreeBuilder {
 /// What every handle of one opened tree shares.
 pub(crate) struct Inner {
     pub(crate) endpoint: Endpoint,
+    /// The user this process runs as: the owner and its clients are one user's.
+    pub(crate) uid: u32,
     pub(crate) options: Options,
     pub(crate) fingerprint: [u8; 32],
     pub(crate) elect_within: Duration,

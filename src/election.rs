@@ -19,7 +19,7 @@ use tokio::net::UnixStream;
 
 use crate::api::Inner;
 use crate::client::Connection;
-use crate::endpoint::Endpoint;
+use crate::endpoint::{Endpoint, same_user};
 use crate::error::{Error, Result};
 use crate::owner::Owner;
 use crate::protocol::VERSION;
@@ -69,15 +69,15 @@ impl Inner {
         loop {
             match open(&self.options).await {
                 Ok(tree) => {
-                    let owner =
-                        Owner::start(tree, &self.endpoint, self.fingerprint).map_err(Error::Io)?;
+                    let owner = Owner::start(tree, &self.endpoint, self.fingerprint, self.uid)
+                        .map_err(Error::Io)?;
                     return Ok(Role::Owner(owner));
                 }
                 Err(error) if is_locked(&error) => {
                     // The welcome may take what is left of the election: a stopped owner
                     // answers once it resumes.
                     let left = self.elect_within.saturating_sub(started.elapsed());
-                    match connect(&self.endpoint, self.fingerprint, left).await {
+                    match connect(&self.endpoint, self.fingerprint, self.uid, left).await {
                         Ok((connection, owner_pid)) => {
                             return Ok(Role::Client {
                                 connection,
@@ -101,21 +101,24 @@ impl Inner {
     }
 }
 
-/// Connect to the owner's socket of `endpoint` and check its welcome against this
-/// process: the protocol, the database and the `fingerprint` of the options that must
-/// agree. The connection and the owner's pid. The connection and the welcome together
-/// take at most `within`: a connect the system never answers was seen on macOS, the
-/// owner gone, and it must not hold up an election for ever.
+/// Connect to the socket the owner of `endpoint`'s database left the path of, and check
+/// the owner against this process: its user `uid`, and in its welcome the protocol, the
+/// database and the `fingerprint` of the options that must agree. The connection and
+/// the owner's pid. The connection and the welcome together take at most `within`: a
+/// connect the system never answers was seen on macOS, the owner gone, and it must not
+/// hold up an election for ever.
 ///
 /// An owner that is on its way in or out, see [`passing`], is an `Error::Io` of that
 /// kind; one that answers what this process cannot take is a `Handshake` or a mismatch.
 pub(crate) async fn connect(
     endpoint: &Endpoint,
     fingerprint: [u8; 32],
+    uid: u32,
     within: Duration,
 ) -> Result<(Arc<Connection>, u32)> {
     let deadline = tokio::time::Instant::now() + within;
-    let stream = tokio::time::timeout_at(deadline, UnixStream::connect(&endpoint.socket))
+    let socket = endpoint.owner_socket().map_err(Error::Io)?;
+    let stream = tokio::time::timeout_at(deadline, UnixStream::connect(&socket))
         .await
         .map_err(|_| {
             Error::Io(io::Error::new(
@@ -124,6 +127,14 @@ pub(crate) async fn connect(
             ))
         })?
         .map_err(Error::Io)?;
+    // The path came from the database's directory: whoever listens there must be this
+    // user's process before it is told anything.
+    same_user(&stream, uid, "the owner").map_err(|error| match error.kind() {
+        io::ErrorKind::PermissionDenied => Error::Handshake(error.to_string()),
+        // An owner that hung up already cannot be asked (`NotConnected` on macOS): it
+        // is going away.
+        _ => Error::Io(error),
+    })?;
     let left = deadline.saturating_duration_since(tokio::time::Instant::now());
     let (connection, welcome) = Connection::open(stream, left).await.map_err(|error| {
         if passing(&error) {
@@ -161,10 +172,12 @@ async fn open(options: &Options) -> surrealkv::Result<Tree> {
 }
 
 /// Whether connecting to the owner failed because the owner is on its way in or out,
-/// which an election waits out: it holds the lock but has not bound its socket yet, or
-/// has just died and left the file (`NotFound`, `ConnectionRefused`); it is stopped and
+/// which an election waits out: it holds the lock but has not bound its socket or left
+/// its path yet, or has just died and left the file (`NotFound`, `ConnectionRefused`);
+/// it is stopped and
 /// silent at its welcome (`TimedOut`); it is closing the database or being killed and
-/// hangs up before its welcome (`UnexpectedEof`, `ConnectionReset`, `BrokenPipe`).
+/// hangs up before its welcome (`UnexpectedEof`, `ConnectionReset`, `BrokenPipe`), or
+/// before it could even be asked whose process it is (`NotConnected`).
 fn passing(error: &io::Error) -> bool {
     matches!(
         error.kind(),
@@ -174,6 +187,7 @@ fn passing(error: &io::Error) -> bool {
             | io::ErrorKind::UnexpectedEof
             | io::ErrorKind::ConnectionReset
             | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::NotConnected
     )
 }
 
@@ -234,13 +248,15 @@ mod tests {
         for welcome in welcomes {
             let _ = std::fs::remove_file(&endpoint.socket);
             let listener = UnixListener::bind(&endpoint.socket).expect("a fake owner");
+            endpoint.publish().expect("the fake owner's socket path");
             let fake = tokio::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("the client");
                 write_frame(&mut stream, &welcome).await.expect("a welcome");
                 // Keep the connection open until the client has read the welcome.
                 tokio::time::sleep(Duration::from_millis(200)).await;
             });
-            let refusal = connect(&endpoint, fingerprint, Duration::from_secs(1))
+            let me = crate::endpoint::uid().expect("this process's user");
+            let refusal = connect(&endpoint, fingerprint, me, Duration::from_secs(1))
                 .await
                 .err()
                 .expect("refused");
@@ -273,6 +289,7 @@ mod tests {
             .expect("the lock");
         let endpoint = Endpoint::new(&db, &run).expect("an endpoint");
         let listener = UnixListener::bind(&endpoint.socket).expect("an owner's socket");
+        endpoint.publish().expect("the owner's socket path");
         let going = tokio::spawn(async move {
             // Hang up on every connection for a while, then let the database go.
             let until = Instant::now() + Duration::from_millis(300);
