@@ -34,7 +34,7 @@ use crate::endpoint::{self, Endpoint};
 use crate::error::{Error, Result};
 use crate::exec::{open, page};
 use crate::protocol::{
-    Answer, At, Item, MAX_ENTRY, Request, Source, TxId, WRITES_AHEAD, Write,
+    Answer, At, DEFAULT_PAGE, Item, MAX_ENTRY, Request, Source, TxId, WRITES_AHEAD, Write,
 };
 use crate::types::{KeyRange, ReadOptions, WireDurability, WireMode, fingerprint};
 
@@ -1181,9 +1181,11 @@ impl Transaction {
         }
     }
 
-    /// `get_many`, or `get_many_at` with a `timestamp`, through the owner. Keys whose
-    /// request or whose values no frame holds are asked for again as their two halves:
-    /// a read can be repeated, and the transaction's snapshot answers the same.
+    /// `get_many`, or `get_many_at` with a `timestamp`, through the owner, in parts as
+    /// a cursor reads in pages: a request asks for as many keys as a page holds
+    /// entries, and the owner answers the first of them, as many as a page holds
+    /// bytes. So no answer outgrows a frame, and no request keeps the owner's thread
+    /// for long. Every part reads the transaction's one snapshot.
     async fn many(
         &self,
         remote: &Remote,
@@ -1191,10 +1193,13 @@ impl Transaction {
         timestamp: Option<u64>,
     ) -> Result<Vec<Option<Value>>> {
         let mut values = Vec::with_capacity(keys.len());
-        // The ranges of `keys` still to ask for, the next one last.
-        let mut parts = vec![0..keys.len()];
-        while let Some(part) = parts.pop() {
-            let asked = keys[part.clone()].to_vec();
+        loop {
+            let asked: Vec<Vec<u8>> = keys[values.len()..]
+                .iter()
+                .take(DEFAULT_PAGE)
+                .cloned()
+                .collect();
+            let wanted = asked.len();
             let answer = remote
                 .ask(&self.inner, self.generation, |tx, writes| match timestamp {
                     None => Request::GetMany {
@@ -1209,18 +1214,19 @@ impl Transaction {
                         timestamp,
                     },
                 })
-                .await;
-            match answer {
-                Ok(answer) => values.extend(got_many(answer)?),
-                Err(Error::TooLarge(_)) if part.len() > 1 => {
-                    let middle = part.start + part.len() / 2;
-                    parts.push(middle..part.end);
-                    parts.push(part.start..middle);
-                }
-                Err(error) => return Err(error),
+                .await?;
+            let got = got_many(answer)?;
+            if got.len() > wanted || (got.is_empty() && wanted > 0) {
+                return Err(Error::Handshake(format!(
+                    "the owner answered {} values to {wanted} keys",
+                    got.len()
+                )));
+            }
+            values.extend(got);
+            if values.len() >= keys.len() {
+                return Ok(values);
             }
         }
-        Ok(values)
     }
 
     /// A cursor over every key, as this transaction sees it.

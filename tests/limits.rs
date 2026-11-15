@@ -38,8 +38,8 @@ async fn a_client_commits_more_than_a_frame_holds() {
     close(owner, client, &base).await;
 }
 
-/// A client reads values that no single frame holds: the owner refuses the answer that
-/// is too large, and the client asks for the halves of its keys.
+/// A client reads values that no single frame holds: the owner answers the values of
+/// many keys in parts, and the client asks for the keys that are left.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_client_reads_many_values_that_no_frame_holds() {
     let base = base("lim2");
@@ -112,5 +112,36 @@ async fn a_request_no_frame_holds_keeps_the_transactions_writes() {
     );
     tx.commit().await.expect("a commit");
     assert!(!client.is_owner().await.expect("a role"), "the owner is the same");
+    close(owner, client, &base).await;
+}
+
+/// The values of many keys come through the owner in parts, and are the same, in the
+/// same order, as the owner's own read of them: more keys than one request asks for,
+/// some of them missing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_reads_more_keys_than_one_request_asks_for() {
+    let base = base("lim5");
+    let (owner, client) = owner_and_client(&base).await;
+    let keys: Vec<Vec<u8>> = (0..1000u32)
+        .map(|n| format!("c{n:04}").into_bytes())
+        .collect();
+    let mut tx = owner.begin().await.expect("a transaction");
+    for (n, key) in keys.iter().enumerate() {
+        if n % 7 != 0 {
+            tx.set(key, format!("value {n}").into_bytes()).expect("a write");
+        }
+    }
+    tx.commit().await.expect("the owner's commit");
+
+    let local = owner.begin().await.expect("a transaction");
+    let remote = client.begin().await.expect("a transaction");
+    let expected = local.get_many(&keys).await.expect("the owner reads");
+    assert_eq!(expected.iter().filter(|value| value.is_none()).count(), 143);
+    assert_eq!(remote.get_many(&keys).await.expect("the client reads"), expected);
+    assert_eq!(
+        remote.get_many::<Vec<u8>>(&[]).await.expect("no keys"),
+        Vec::<Option<Vec<u8>>>::new()
+    );
+    drop((local, remote));
     close(owner, client, &base).await;
 }

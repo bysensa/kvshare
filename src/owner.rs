@@ -16,7 +16,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use crate::admin::{Maintenance, run_blocking};
 use crate::endpoint::{Endpoint, same_user};
 use crate::error::KvError;
-use crate::exec::{apply, page};
+use crate::exec::{apply, many, page};
 use crate::protocol::{
     Answer, Hello, MAX_TRANSACTIONS, OLDEST, Request, RequestId, TxId, Unframed, VERSION, Welcome,
     Write, encode_frame, read_frame, write_frame,
@@ -256,7 +256,7 @@ async fn serve(
                 Ok(Answer::Got(value))
             }),
             Request::GetMany { tx, writes, keys } => table.on(tx, writes, |transaction| {
-                Ok(Answer::GotMany(transaction.get_many(&keys)?))
+                many(&keys, |key| transaction.get(key))
             }),
             Request::GetAt {
                 tx,
@@ -272,7 +272,7 @@ async fn serve(
                 keys,
                 timestamp,
             } => table.on(tx, writes, |transaction| {
-                Ok(Answer::GotMany(transaction.get_many_at(&keys, timestamp)?))
+                many(&keys, |key| transaction.get_at(key, timestamp))
             }),
             Request::Cursor {
                 tx,

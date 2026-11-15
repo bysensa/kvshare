@@ -14,7 +14,7 @@
 
 use surrealkv::{HistoryOptions, LSMIterator, Transaction, WriteOptions};
 
-use crate::protocol::{At, Fetched, Item, Nth, PAGE_BYTES, Position, Source, Write};
+use crate::protocol::{Answer, At, Fetched, Item, Nth, PAGE_BYTES, Position, Source, Write};
 use crate::types::just_past;
 
 /// Apply `writes` to `transaction` in their order, each by the SurrealKV method the
@@ -49,6 +49,26 @@ pub(crate) fn apply(transaction: &mut Transaction, writes: Vec<Write>) -> surrea
         }
     }
     Ok(())
+}
+
+/// The values of the first of `keys`, each read by `get`: as many as hold
+/// [`PAGE_BYTES`] together, and one at least. The client asks for the keys that are
+/// left, so the values of many keys come in parts, as the pages of a cursor do: no
+/// answer outgrows a frame, and no request keeps the owner's thread for long.
+pub(crate) fn many(
+    keys: &[Vec<u8>],
+    mut get: impl FnMut(&[u8]) -> surrealkv::Result<Option<Vec<u8>>>,
+) -> surrealkv::Result<Answer> {
+    let (mut values, mut bytes) = (Vec::new(), 0);
+    for key in keys {
+        if bytes >= PAGE_BYTES {
+            break;
+        }
+        let value = get(key)?;
+        bytes += value.as_ref().map_or(0, Vec::len);
+        values.push(value);
+    }
+    Ok(Answer::GotMany(values))
 }
 
 /// The `WriteOptions` a client gave, which hold only a time.
