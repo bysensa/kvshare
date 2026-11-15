@@ -209,7 +209,7 @@ fn is_locked(error: &surrealkv::Error) -> bool {
 
 /// A pause between `low` and `high`, different in every process, so that processes
 /// that lost the same owner do not open the database in step.
-fn jitter(low: Duration, high: Duration) -> Duration {
+pub(crate) fn jitter(low: Duration, high: Duration) -> Duration {
     let spread = (high - low).as_nanos() as u64;
     let draw = RandomState::new().hash_one(Instant::now());
     low + Duration::from_nanos(draw % spread.max(1))

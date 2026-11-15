@@ -39,7 +39,7 @@ pub use admin::{BackgroundError, CheckpointMetadata};
 // Hidden, as SurrealKV hides what `Tree::encryption_status` answers.
 #[doc(hidden)]
 pub use admin::{EncryptionStatus, FileTotals, KeyUsage};
-pub use api::{Transaction, Tree, TreeBuilder};
+pub use api::{Operation, Transaction, Tree, TreeBuilder};
 pub use cursor::{Cursor, InternalKeyRef};
 pub use error::{Error, Result};
 pub use protocol::MAX_ENTRY;

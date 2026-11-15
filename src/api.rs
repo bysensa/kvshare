@@ -16,7 +16,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use surrealkv::{
     CipherPreference, CompactRangeOptions, Comparator, CompressionType, Durability, FilterPolicy,
@@ -29,7 +29,7 @@ use crate::admin::{
 };
 use crate::client::{Connection, Lost, Sent};
 use crate::cursor::Cursor;
-use crate::election::{Current, Role, connect};
+use crate::election::{Current, Role, connect, jitter};
 use crate::endpoint::{self, Endpoint};
 use crate::error::{Error, Result};
 use crate::exec::{open, page};
@@ -466,6 +466,96 @@ impl Tree {
         f(&mut transaction).await
     }
 
+    /// Run `operation` in a transaction until it is known to have committed once, for
+    /// at most `within`.
+    ///
+    /// [`Operation::apply`] reads and writes in the transaction it is given, and is
+    /// called again, with a new transaction, for every attempt. An attempt is repeated
+    /// after a pause when another transaction won a conflict, and when the owner was
+    /// lost, silent or being elected; any other error ends the call with it.
+    ///
+    /// A commit whose answer never came (`OwnerSilent`, `OwnerLost`) may have happened.
+    /// Before the next attempt [`Operation::landed`] is asked, in a transaction begun
+    /// after that commit, whether it did: `Some` ends the call with its value, and
+    /// `None` lets `apply` run again.
+    ///
+    /// When the time is up while a commit's outcome is still unknown, the error is
+    /// that commit's, `OwnerSilent` or `OwnerLost`.
+    pub async fn transact<O: Operation>(
+        &self,
+        within: Duration,
+        operation: &mut O,
+    ) -> Result<O::Output> {
+        let started = Instant::now();
+        // The error of a commit whose outcome is not known yet.
+        let mut in_doubt: Option<Error> = None;
+        loop {
+            let failed = match self.attempt(in_doubt.is_some(), operation).await {
+                Ok(value) => return Ok(value),
+                Err(failed) => failed,
+            };
+            if failed.settled {
+                in_doubt = None;
+            }
+            let pause = match &failed.error {
+                Error::TransactionWriteConflict | Error::TransactionRetry => {
+                    jitter(Duration::from_millis(1), Duration::from_millis(10))
+                }
+                Error::OwnerLost(_)
+                | Error::OwnerSilent { .. }
+                | Error::NoOwner { .. }
+                | Error::WriteStall { .. } => {
+                    jitter(Duration::from_millis(20), Duration::from_millis(100))
+                }
+                _ => return Err(in_doubt.unwrap_or(failed.error)),
+            };
+            let unanswered = failed.at_commit
+                && matches!(failed.error, Error::OwnerLost(_) | Error::OwnerSilent { .. });
+            let last = if unanswered {
+                in_doubt = Some(failed.error);
+                None
+            } else {
+                Some(failed.error)
+            };
+            if started.elapsed() + pause >= within {
+                return Err(in_doubt
+                    .or(last)
+                    .expect("the attempt failed with an error"));
+            }
+            tokio::time::sleep(pause).await;
+        }
+    }
+
+    /// One attempt of [`Tree::transact`]: with a commit `in_doubt`, ask whether it
+    /// landed; then apply and commit.
+    async fn attempt<O: Operation>(
+        &self,
+        in_doubt: bool,
+        operation: &mut O,
+    ) -> std::result::Result<O::Output, Failed> {
+        let failed = |settled: bool, at_commit: bool| {
+            move |error: Error| Failed {
+                error,
+                settled,
+                at_commit,
+            }
+        };
+        if in_doubt {
+            let unsettled = failed(false, false);
+            let tx = self.begin_with_mode(Mode::ReadOnly).await.map_err(unsettled)?;
+            if let Some(value) = operation.landed(&tx).await.map_err(unsettled)? {
+                return Ok(value);
+            }
+        }
+        let mut tx = self.begin().await.map_err(failed(in_doubt, false))?;
+        let value = operation
+            .apply(&mut tx)
+            .await
+            .map_err(failed(in_doubt, false))?;
+        tx.commit().await.map_err(failed(in_doubt, true))?;
+        Ok(value)
+    }
+
     /// Make a checkpoint of the database in `checkpoint_dir`, which must lie outside the
     /// database's directory. A relative path is this process's: it is made absolute
     /// before the owner sees it. The owner's process writes the files.
@@ -613,6 +703,78 @@ impl Tree {
             }
         }
     }
+}
+
+/// The work of a transaction that [`Tree::transact`] runs until it is known to have
+/// committed once.
+///
+/// The work has to leave something [`Operation::landed`] can find again: the name of
+/// the operation in a key or a value it writes, say. The methods answer futures that
+/// are `Send`, so that `transact` can be awaited in a spawned task; an implementation
+/// writes them as `async fn`.
+///
+/// ```no_run
+/// # use std::time::Duration;
+/// use kvshare::{Operation, Result, Transaction, Tree};
+///
+/// /// Add `by` to the stock, as the operation named `name`.
+/// struct Restock {
+///     name: Vec<u8>,
+///     by: u64,
+/// }
+///
+/// impl Operation for Restock {
+///     type Output = u64;
+///
+///     async fn apply(&mut self, tx: &mut Transaction) -> Result<u64> {
+///         let stock = match tx.get_for_update(b"stock").await? {
+///             Some(bytes) => u64::from_le_bytes(bytes.try_into().unwrap()),
+///             None => 0,
+///         };
+///         tx.set(b"stock", &(stock + self.by).to_le_bytes())?;
+///         // What `landed` finds: the operation's name, with the stock it left.
+///         tx.set(&self.name, &(stock + self.by).to_le_bytes())?;
+///         Ok(stock + self.by)
+///     }
+///
+///     async fn landed(&mut self, tx: &Transaction) -> Result<Option<u64>> {
+///         let left = tx.get(&self.name).await?;
+///         Ok(left.map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap())))
+///     }
+/// }
+///
+/// # async fn example(tree: Tree) -> Result<()> {
+/// let mut restock = Restock { name: b"op/7f3a".to_vec(), by: 5 };
+/// let stock = tree.transact(Duration::from_secs(10), &mut restock).await?;
+/// # Ok(())
+/// # }
+/// ```
+pub trait Operation {
+    /// What the operation answers.
+    type Output;
+
+    /// Read and write in `tx`. Called for every attempt, each time with a new
+    /// transaction; what it answers is the call's answer once the commit is known.
+    fn apply(
+        &mut self,
+        tx: &mut Transaction,
+    ) -> impl Future<Output = Result<Self::Output>> + Send;
+
+    /// Whether the commit of an earlier attempt is in the database, read in `tx`: the
+    /// operation's answer if it is.
+    fn landed(
+        &mut self,
+        tx: &Transaction,
+    ) -> impl Future<Output = Result<Option<Self::Output>>> + Send;
+}
+
+/// How an attempt of [`Tree::transact`] failed.
+struct Failed {
+    error: Error,
+    /// Whether the attempt first found that an earlier commit in doubt did not happen.
+    settled: bool,
+    /// Whether it was the commit that failed.
+    at_commit: bool,
 }
 
 /// The end of an operation that answers nothing but that it is done.
