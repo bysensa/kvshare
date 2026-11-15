@@ -16,7 +16,25 @@ use surrealkv::WriteStallReason;
 use crate::protocol::{TxId, Unframed};
 
 /// Why an operation failed.
+///
+/// kvshare may add errors: a `match` on an `Error` outside this crate needs an arm for
+/// the ones it does not name.
+///
+/// ```compile_fail
+/// fn name(error: kvshare::Error) -> &'static str {
+///     use kvshare::Error::*;
+///     match error {
+///         TransactionWriteConflict | TransactionRetry | TransactionClosed => "transaction",
+///         TransactionReadOnly | TransactionWriteOnly | TransactionWithoutSavepoint => "mode",
+///         EmptyKey | KeyNotFound | InvalidArgument(_) | TooLarge(_) => "argument",
+///         WriteStall { .. } | Engine(_) | TooManyTransactions => "engine",
+///         OwnerLost(_) | OwnerSilent { .. } | NoOwner { .. } => "owner",
+///         Handshake(_) | VersionMismatch { .. } | OptionsMismatch | Io(_) => "meeting",
+///     }
+/// }
+/// ```
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Error {
     /// Another transaction committed a write to a key this one wrote first.
     TransactionWriteConflict,
@@ -59,7 +77,8 @@ pub enum Error {
     },
     /// The owner refused the connection, or answered out of turn.
     Handshake(String),
-    /// The owner speaks another version of the protocol.
+    /// The owner and this process speak no version of the protocol in common: `owner`
+    /// is the owner's version nearest to `this`, the newest this process speaks.
     VersionMismatch {
         owner: u32,
         this: u32,
@@ -107,7 +126,14 @@ impl fmt::Display for Error {
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Io(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 /// An error as it travels from the owner to a client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -213,6 +239,19 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An error of the operating system is the source of the `Io` that carries it; the
+    /// other errors have none.
+    #[test]
+    fn an_io_error_is_the_source_of_its_error() {
+        use std::error::Error as _;
+        let error = Error::Io(io::Error::other("the disk"));
+        assert_eq!(
+            error.source().map(ToString::to_string).as_deref(),
+            Some("the disk")
+        );
+        assert!(Error::EmptyKey.source().is_none());
+    }
 
     /// A write stall crosses the socket as the variant and the reason SurrealKV gave.
     #[test]

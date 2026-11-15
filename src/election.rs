@@ -22,7 +22,7 @@ use crate::client::Connection;
 use crate::endpoint::{Endpoint, same_user};
 use crate::error::{Error, Result};
 use crate::owner::Owner;
-use crate::protocol::VERSION;
+use crate::protocol::{VERSION, agreed};
 
 /// This process's part in a shared database.
 pub(crate) enum Role {
@@ -143,9 +143,15 @@ pub(crate) async fn connect(
             Error::Handshake(error.to_string())
         }
     })?;
-    if welcome.version != VERSION {
+    if agreed(welcome.oldest, welcome.version).is_none() {
+        // Of the owner's versions, the one nearest to this process's.
+        let owner = if welcome.version < VERSION {
+            welcome.version
+        } else {
+            welcome.oldest
+        };
         return Err(Error::VersionMismatch {
-            owner: welcome.version,
+            owner,
             this: VERSION,
         });
     }
@@ -214,7 +220,7 @@ mod tests {
     use tokio::net::UnixListener;
 
     use super::*;
-    use crate::protocol::{Welcome, write_frame};
+    use crate::protocol::{Hello, OLDEST, Welcome, read_frame, write_frame};
 
     /// A client refuses an owner that speaks another version of the protocol, or holds
     /// another database, or set the options that must agree otherwise, before its
@@ -226,19 +232,31 @@ mod tests {
         std::fs::create_dir_all(base.join("run")).expect("the run directory");
         let fingerprint = [7u8; 32];
         let welcomes = [
+            // Only versions newer than this process speaks.
             Welcome {
-                version: VERSION + 1,
+                oldest: VERSION + 1,
+                version: VERSION + 2,
+                db: endpoint.db.clone(),
+                owner_pid: 1,
+                fingerprint,
+            },
+            // Only versions older.
+            Welcome {
+                oldest: OLDEST - 2,
+                version: OLDEST - 1,
                 db: endpoint.db.clone(),
                 owner_pid: 1,
                 fingerprint,
             },
             Welcome {
+                oldest: VERSION,
                 version: VERSION,
                 db: base.join("another"),
                 owner_pid: 1,
                 fingerprint,
             },
             Welcome {
+                oldest: VERSION,
                 version: VERSION,
                 db: endpoint.db.clone(),
                 owner_pid: 1,
@@ -262,7 +280,11 @@ mod tests {
                 .expect("refused");
             match refusal {
                 Error::VersionMismatch { owner, this } => {
-                    assert_eq!((owner, this), (VERSION + 1, VERSION));
+                    assert!(
+                        owner == VERSION + 1 || owner == OLDEST - 1,
+                        "the owner's version nearest to this one, not {owner}"
+                    );
+                    assert_eq!(this, VERSION);
                 }
                 Error::Handshake(reason) => assert!(reason.contains("another"), "{reason}"),
                 Error::OptionsMismatch => {}
@@ -270,6 +292,43 @@ mod tests {
             }
             fake.await.expect("the fake owner ends");
         }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// An owner that speaks newer versions as well as this process's is an owner this
+    /// process works through: the client tells it the newest version both speak.
+    #[tokio::test]
+    async fn a_client_names_the_newest_version_it_shares_with_its_owner() {
+        let base = std::env::temp_dir().join(format!("kvo-hello-{}", std::process::id()));
+        let endpoint = Endpoint::new(&base.join("db"), &base.join("run")).expect("an endpoint");
+        std::fs::create_dir_all(base.join("run")).expect("the run directory");
+        let _ = std::fs::remove_file(&endpoint.socket);
+        let listener = UnixListener::bind(&endpoint.socket).expect("a fake owner");
+        endpoint.publish().expect("the fake owner's socket path");
+        let fingerprint = [7u8; 32];
+        let welcome = Welcome {
+            oldest: OLDEST,
+            version: VERSION + 3,
+            db: endpoint.db.clone(),
+            owner_pid: 1,
+            fingerprint,
+        };
+        let newer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("the client");
+            write_frame(&mut stream, &welcome).await.expect("a welcome");
+            read_frame::<_, Hello>(&mut stream)
+                .await
+                .expect("the client's hello")
+        });
+        let me = crate::endpoint::uid().expect("this process's user");
+        let (_connection, owner_pid) = connect(&endpoint, fingerprint, me, Duration::from_secs(1))
+            .await
+            .expect("an owner that speaks this version too");
+        assert_eq!(owner_pid, 1);
+        assert_eq!(
+            newer.await.expect("the fake owner ends"),
+            Hello { version: VERSION }
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 

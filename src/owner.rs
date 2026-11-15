@@ -18,8 +18,8 @@ use crate::endpoint::{Endpoint, same_user};
 use crate::error::KvError;
 use crate::exec::{apply, page};
 use crate::protocol::{
-    Answer, MAX_TRANSACTIONS, Request, RequestId, TxId, Unframed, VERSION, Welcome, Write,
-    encode_frame, read_frame, write_frame,
+    Answer, Hello, MAX_TRANSACTIONS, OLDEST, Request, RequestId, TxId, Unframed, VERSION, Welcome,
+    Write, encode_frame, read_frame, write_frame,
 };
 use crate::types::{WireDurability, WireMode};
 
@@ -69,6 +69,7 @@ impl Owner {
         let listener = UnixListener::bind(&endpoint.socket)?;
         endpoint.publish()?;
         let welcome = Arc::new(Welcome {
+            oldest: OLDEST,
             version: VERSION,
             db: endpoint.db.clone(),
             owner_pid: std::process::id(),
@@ -200,6 +201,12 @@ async fn serve(
         return;
     }
     let mut reader = BufReader::new(read);
+    // The client's first frame names the version it speaks, one of those the welcome
+    // offered. One that names another, or goes away, is not served.
+    match read_frame::<_, Hello>(&mut reader).await {
+        Ok(hello) if (OLDEST..=VERSION).contains(&hello.version) => {}
+        _ => return,
+    }
     let mut table = Table {
         tree,
         open: HashMap::new(),
@@ -492,6 +499,73 @@ mod tests {
             "the write after it was not"
         );
         drop(table);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod versions {
+    use super::*;
+
+    /// The owner offers the versions it speaks and serves a client that names one of
+    /// them; a client that names another is hung up on.
+    #[tokio::test]
+    async fn a_client_is_served_in_a_version_the_owner_speaks() {
+        let base = std::env::temp_dir().join(format!("kvo-versions-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let endpoint = Endpoint::new(&base.join("db"), &base.join("run")).expect("an endpoint");
+        let tree = surrealkv::TreeBuilder::new()
+            .with_path(endpoint.db.clone())
+            .build()
+            .expect("a tree");
+        let me = crate::endpoint::uid().expect("this process's user");
+        let owner = Owner::start(tree, &endpoint, [0; 32], me).expect("an owner");
+
+        let mut stranger = UnixStream::connect(&endpoint.socket).await.expect("connected");
+        let welcome: Welcome = read_frame(&mut stranger).await.expect("a welcome");
+        assert_eq!((welcome.oldest, welcome.version), (OLDEST, VERSION));
+        let hello = Hello {
+            version: VERSION + 1,
+        };
+        write_frame(&mut stranger, &hello).await.expect("a hello");
+        let read = (
+            1u64,
+            Request::Get {
+                tx: 1,
+                writes: Vec::new(),
+                key: b"k".to_vec(),
+                for_update: false,
+            },
+        );
+        let _ = write_frame(&mut stranger, &read).await;
+        assert!(
+            read_frame::<_, (RequestId, Answer)>(&mut stranger)
+                .await
+                .is_err(),
+            "the owner hangs up on a version it does not speak"
+        );
+
+        let mut client = UnixStream::connect(&endpoint.socket).await.expect("connected");
+        let _: Welcome = read_frame(&mut client).await.expect("a welcome");
+        let hello = Hello { version: VERSION };
+        write_frame(&mut client, &hello).await.expect("a hello");
+        let begin = (
+            1u64,
+            Request::Begin {
+                tx: 1,
+                mode: WireMode::ReadOnly,
+                durability: WireDurability::Eventual,
+                after_commits: false,
+            },
+        );
+        write_frame(&mut client, &begin).await.expect("a begin");
+        write_frame(&mut client, &(2u64, read.1)).await.expect("a read");
+        let (id, answer): (RequestId, Answer) = read_frame(&mut client).await.expect("an answer");
+        assert_eq!(id, 2);
+        assert!(matches!(answer, Answer::Got(None)), "{answer:?}");
+
+        drop(client);
+        owner.close().await.expect("the owner closes");
         let _ = std::fs::remove_dir_all(&base);
     }
 }

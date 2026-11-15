@@ -28,7 +28,9 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::protocol::{Answer, Request, RequestId, Unframed, Welcome, encode_frame, read_frame};
+use crate::protocol::{
+    Answer, Hello, Request, RequestId, Unframed, Welcome, agreed, encode_frame, read_frame,
+};
 
 /// How many bytes of frames may wait for the writer before another frame has to wait
 /// for room. A frame is taken while fewer wait, so at most this and one frame do.
@@ -109,7 +111,9 @@ impl Drop for Sent<'_> {
 
 impl Connection {
     /// Read the owner's welcome on `stream` within `within`, then read its answers and
-    /// write the requests in tasks of their own. Must be called on a Tokio runtime.
+    /// write the requests in tasks of their own. If the owner speaks a version of the
+    /// protocol this process speaks, the first frame written tells it which. Must be
+    /// called on a Tokio runtime.
     pub async fn open(stream: UnixStream, within: Duration) -> io::Result<(Connection, Welcome)> {
         let (read, write) = stream.into_split();
         let mut reader = BufReader::new(read);
@@ -119,6 +123,11 @@ impl Connection {
         let waiting: Arc<Waiting> = Arc::new(Mutex::new(Some(Unanswered::default())));
         let queued = Arc::new(Queued::default());
         let (frames, to_write) = mpsc::unbounded_channel();
+        if let Some(version) = agreed(welcome.oldest, welcome.version) {
+            let hello = encode_frame(&Hello { version }).map_err(io::Error::from)?;
+            queued.bytes.fetch_add(hello.len(), Ordering::AcqRel);
+            let _ = frames.send(hello);
+        }
         let connection = Connection {
             frames,
             reader: tokio::spawn(read_answers(
@@ -318,10 +327,12 @@ mod tests {
     use crate::protocol::{MAX_FRAME, VERSION, Write, write_frame};
     use crate::types::WireDurability;
 
-    /// A connection to a peer that welcomes it and then reads only when told to.
+    /// A connection to a peer that welcomes it, takes its hello, and then reads only
+    /// when told to.
     async fn connection() -> (Connection, UnixStream) {
         let (ours, mut theirs) = UnixStream::pair().expect("a pair of sockets");
         let welcome = Welcome {
+            oldest: VERSION,
             version: VERSION,
             db: "/nowhere".into(),
             owner_pid: 1,
@@ -331,6 +342,8 @@ mod tests {
         let (connection, _) = Connection::open(ours, Duration::from_secs(1))
             .await
             .expect("a connection");
+        let hello: Hello = read_frame(&mut theirs).await.expect("the client's hello");
+        assert_eq!(hello, Hello { version: VERSION });
         (connection, theirs)
     }
 

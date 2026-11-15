@@ -1,10 +1,14 @@
 //! What the owner and its clients say to each other, and how it travels.
 //!
 //! A message is a frame: its length as a little-endian `u32`, then the message in
-//! postcard. The owner's first frame is a [`Welcome`]: the version of the protocol, the
-//! canonical path of the database it owns, its pid, and the fingerprint of the options
-//! that every process must set alike. A client of another version, or one that meant
-//! another database or other options, refuses before its first request.
+//! postcard. The owner's first frame is a [`Welcome`]: the versions of the protocol it
+//! speaks, from the oldest to the newest, the canonical path of the database it owns,
+//! its pid, and the fingerprint of the options that every process must set alike. A
+//! client that speaks none of those versions, or one that meant another database or
+//! other options, refuses before its first request. Otherwise its first frame is a
+//! [`Hello`] that names the version both will speak, the newest they have in common.
+//! The welcome and the hello keep their shape in every version, so that a process of
+//! any version can read them.
 //!
 //! Then the client sends `(id, Request)` frames and the owner answers `(id, Answer)`
 //! frames with the same id, in any order: requests of several tasks of one process
@@ -38,8 +42,21 @@ use crate::admin::{Admin, Reply};
 use crate::error::KvError;
 use crate::types::{WireDurability, WireMode};
 
-/// The version of the protocol. Bump it when a message would mean something else.
+/// The version of the protocol, the newest this build speaks. Bump it when a message
+/// would mean something else.
 pub const VERSION: u32 = 8;
+
+/// The oldest version of the protocol this build still speaks. It stays behind
+/// [`VERSION`] for as long as a build answers a process of an older one the way that
+/// process expects.
+pub const OLDEST: u32 = 8;
+
+/// The version to speak with a peer that speaks `oldest` to `newest`: the newest both
+/// speak, if there is one.
+pub(crate) fn agreed(oldest: u32, newest: u32) -> Option<u32> {
+    let spoken = newest.min(VERSION);
+    (spoken >= oldest.max(OLDEST)).then_some(spoken)
+}
 
 /// How many transactions one connection may hold open at once.
 pub const MAX_TRANSACTIONS: usize = 64;
@@ -71,15 +88,27 @@ pub type TxId = u64;
 /// A request's number on its connection; the answer carries it back.
 pub type RequestId = u64;
 
-/// What the owner hands a connection when it begins.
+/// What the owner hands a connection when it begins. Its shape is the same in every
+/// version of the protocol.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct Welcome {
+    /// The oldest version of the protocol the owner speaks.
+    pub(crate) oldest: u32,
+    /// The newest.
     pub(crate) version: u32,
     /// The canonical path of the database the owner holds.
     pub(crate) db: PathBuf,
     pub(crate) owner_pid: u32,
     /// The fingerprint of the options every process must set alike.
     pub(crate) fingerprint: [u8; 32],
+}
+
+/// What a client answers the welcome with, before its first request: the version of
+/// the protocol it will speak, one of the owner's. Its shape is the same in every
+/// version.
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Hello {
+    pub(crate) version: u32,
 }
 
 /// A write a transaction makes, one kind for each SurrealKV method, which the owner
