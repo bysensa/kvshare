@@ -343,15 +343,19 @@ impl Inner {
         let done = match deadline {
             Some(deadline) => tokio::time::timeout_at(deadline, step)
                 .await
-                .map_err(|_| Error::OwnerSilent {
-                    pid: owner_pid,
-                    waited: self.call_within,
+                .map_err(|_| {
+                    tracing::warn!(owner = owner_pid, waited = ?self.call_within, "the owner is silent");
+                    Error::OwnerSilent {
+                        pid: owner_pid,
+                        waited: self.call_within,
+                    }
                 })?,
             None => step.await,
         };
         match done {
             Ok(done) => Ok(done),
             Err(Lost(reason)) => {
+                tracing::warn!(owner = owner_pid, %reason, "the owner is lost");
                 self.forget(generation).await;
                 Err(Error::OwnerLost(reason))
             }

@@ -509,6 +509,7 @@ dependencies = [
  "serde",
  "surrealkv",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -119,6 +119,7 @@ impl Owner {
     /// is waited for to its end, see [`Maintenance`]; one asked for meanwhile finds the
     /// tree closed.
     pub(crate) async fn close(mut self) -> Result<(), surrealkv::Error> {
+        let started = std::time::Instant::now();
         // Aborting the accept task drops its set of connections, which aborts them.
         self.accept.abort();
         let _ = (&mut self.accept).await;
@@ -126,7 +127,9 @@ impl Owner {
         // Removed while the lock is still held: the next owner's are its own.
         let _ = std::fs::remove_file(&self.pointer);
         let _ = std::fs::remove_file(&self.socket);
-        self.tree.close().await
+        let closed = self.tree.close().await;
+        tracing::info!(took = ?started.elapsed(), "handed the database over");
+        closed
     }
 }
 
@@ -155,7 +158,8 @@ async fn accept(
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
-                if same_user(&stream, uid, "a client").is_err() {
+                if let Err(error) = same_user(&stream, uid, "a client") {
+                    tracing::warn!(%error, "hung up on a client");
                     continue;
                 }
                 connections.spawn(serve(
@@ -167,7 +171,10 @@ async fn accept(
             }
             // Out of descriptors, or a connection reset before it was taken: wait a
             // little rather than spin on an error that repeats.
-            Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+            Err(error) => {
+                tracing::warn!(%error, "could not take a connection");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
         }
         while connections.try_join_next().is_some() {}
     }
@@ -205,7 +212,14 @@ async fn serve(
     // offered. One that names another, or goes away, is not served.
     match read_frame::<_, Hello>(&mut reader).await {
         Ok(hello) if (OLDEST..=VERSION).contains(&hello.version) => {}
-        _ => return,
+        Ok(hello) => {
+            tracing::warn!(
+                version = hello.version,
+                "hung up on a client that speaks another version"
+            );
+            return;
+        }
+        Err(_) => return,
     }
     let mut table = Table {
         tree,

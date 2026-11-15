@@ -71,6 +71,11 @@ impl Inner {
                 Ok(tree) => {
                     let owner = Owner::start(tree, &self.endpoint, self.fingerprint, self.uid)
                         .map_err(Error::Io)?;
+                    tracing::info!(
+                        db = %self.endpoint.db.display(),
+                        socket = %self.endpoint.socket.display(),
+                        "owns the database"
+                    );
                     return Ok(Role::Owner(owner));
                 }
                 Err(error) if is_locked(&error) => {
@@ -79,19 +84,34 @@ impl Inner {
                     let left = self.elect_within.saturating_sub(started.elapsed());
                     match connect(&self.endpoint, self.fingerprint, self.uid, left).await {
                         Ok((connection, owner_pid)) => {
+                            tracing::info!(
+                                db = %self.endpoint.db.display(),
+                                owner = owner_pid,
+                                "works through the owner"
+                            );
                             return Ok(Role::Client {
                                 connection,
                                 owner_pid,
                             });
                         }
                         // The owner is on its way in or out: open again after a pause.
-                        Err(Error::Io(error)) if passing(&error) => {}
-                        Err(other) => return Err(other),
+                        Err(Error::Io(error)) if passing(&error) => {
+                            tracing::debug!(%error, "the owner is on its way in or out");
+                        }
+                        Err(other) => {
+                            tracing::warn!(error = %other, "the owner cannot be worked through");
+                            return Err(other);
+                        }
                     }
                 }
                 Err(error) => return Err(error.into()),
             }
             if started.elapsed() >= self.elect_within {
+                tracing::warn!(
+                    db = %self.endpoint.db.display(),
+                    waited = ?started.elapsed(),
+                    "no owner in time"
+                );
                 return Err(Error::NoOwner {
                     waited: started.elapsed(),
                 });
