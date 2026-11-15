@@ -151,6 +151,50 @@ async fn the_tasks_of_one_client_share_its_connection() {
     close(owner, client, &base).await;
 }
 
+/// How many commits a second `tasks` tasks of `tree` make, each committing `each` small
+/// transactions that wait for the disk.
+async fn commits_a_second(tree: &kvshare::Tree, tasks: usize, each: usize, tag: &str) -> f64 {
+    let started = std::time::Instant::now();
+    let mut running = Vec::new();
+    for task in 0..tasks {
+        let (tree, tag) = (tree.clone(), tag.to_string());
+        running.push(tokio::spawn(async move {
+            for n in 0..each {
+                let mut tx = tree
+                    .begin()
+                    .await
+                    .expect("a transaction")
+                    .with_durability(kvshare::Durability::Immediate);
+                tx.set(format!("{tag}-{task}-{n}").into_bytes(), b"v")
+                    .expect("a write");
+                tx.commit().await.expect("a commit");
+            }
+        }));
+    }
+    for task in running {
+        task.await.expect("a task ends");
+    }
+    (tasks * each) as f64 / started.elapsed().as_secs_f64()
+}
+
+/// The tasks of one client commit together: a transaction that begins does not wait
+/// for the commits of other tasks that are still being waited for, so SurrealKV writes
+/// them to the disk in one group, as it does for the tasks of the owner. Eight tasks
+/// then commit well over one and a half times as much as one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_tasks_of_one_client_commit_together() {
+    let base = base("together");
+    let (owner, client) = owner_and_client(&base).await;
+    let one = commits_a_second(&client, 1, 50, "one").await;
+    let eight = commits_a_second(&client, 8, 50, "eight").await;
+    println!("commits a second through one connection: one task {one:.0}, eight tasks {eight:.0}");
+    assert!(
+        eight > one * 1.5,
+        "eight tasks of a client commit {eight:.0} a second, one task {one:.0}"
+    );
+    close(owner, client, &base).await;
+}
+
 /// A client that goes away leaves the owner's database open: the owner keeps committing
 /// after the connection's table is gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

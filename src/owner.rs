@@ -157,12 +157,13 @@ async fn accept(
 /// Requests are handled in their order, so a transaction a client begins without
 /// waiting is open before its next request. A commit, and an operation on the whole
 /// database, runs in a task of its own, so one that waits for a sync or copies files does
-/// not hold up the client's other requests. A transaction begins only once the commits
-/// the client sent before it are done, so that its snapshot holds them: a client that
-/// stopped waiting for a commit (`OwnerSilent`) learns by reading whether it landed, and
-/// does not find it absent and then present. When the client goes away, its table is
-/// dropped, which rolls back what it left open, and the work already started runs to its
-/// end.
+/// not hold up the client's other requests. A transaction begins at once, so the tasks
+/// of one client commit together; unless its client stopped waiting for a commit that
+/// is still unanswered (`OwnerSilent`), and says so. That transaction begins only once
+/// the commits sent before it are done, so that its snapshot holds them: the client
+/// learns by reading whether the commit landed, and does not find it absent and then
+/// present. When the client goes away, its table is dropped, which rolls back what it
+/// left open, and the work already started runs to its end.
 async fn serve(
     stream: UnixStream,
     tree: Arc<Tree>,
@@ -193,8 +194,11 @@ async fn serve(
                 tx,
                 mode,
                 durability,
+                after_commits,
             } => {
-                while commits.join_next().await.is_some() {}
+                if after_commits {
+                    while commits.join_next().await.is_some() {}
+                }
                 table.begin(tx, mode, durability);
                 continue;
             }

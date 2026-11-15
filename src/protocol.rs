@@ -276,11 +276,13 @@ impl Item {
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Request {
     /// Begin transaction `tx`. It has no answer: a failure comes back on the next request
-    /// on `tx`.
+    /// on `tx`. With `after_commits`, the owner begins it only once the commits the
+    /// connection sent before it are done: the client stopped waiting for one of them.
     Begin {
         tx: TxId,
         mode: WireMode,
         durability: WireDurability,
+        after_commits: bool,
     },
     /// `get`, or `get_for_update`.
     Get {

@@ -11,8 +11,12 @@
 //! memory until the owner resumes. A frame is queued while fewer than [`MAX_QUEUED`]
 //! bytes wait; one that finds no room waits for it, which its caller bounds with the
 //! call timeout, and is not sent if the caller gives up first.
+//!
+//! A commit whose caller stopped waiting while the owner has not answered it is in
+//! doubt: it may land at any time. The connection knows whether one is, so that a
+//! transaction begun meanwhile can ask the owner to begin it after those commits.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -38,13 +42,21 @@ pub struct Lost(pub String);
 pub struct Frame {
     id: RequestId,
     bytes: Vec<u8>,
+    /// Whether the request is a commit.
+    commit: bool,
 }
 
-/// The callers waiting for an answer, by request id.
-type Callers = HashMap<RequestId, oneshot::Sender<Answer>>;
+/// The requests the owner has not answered yet.
+#[derive(Default)]
+struct Unanswered {
+    /// The callers waiting for an answer, by request id.
+    callers: HashMap<RequestId, oneshot::Sender<Answer>>,
+    /// The commits whose callers stopped waiting.
+    in_doubt: HashSet<RequestId>,
+}
 
-/// The callers waiting for an answer; `None` once the connection ended.
-type Waiting = Mutex<Option<Callers>>;
+/// The requests the owner has not answered yet; `None` once the connection ended.
+type Waiting = Mutex<Option<Unanswered>>;
 
 /// The frames queued for the writer and not written yet.
 #[derive(Default)]
@@ -70,6 +82,7 @@ pub struct Connection {
 pub struct Sent<'c> {
     connection: &'c Connection,
     id: RequestId,
+    commit: bool,
     answered: oneshot::Receiver<Answer>,
 }
 
@@ -83,9 +96,13 @@ impl Sent<'_> {
 impl Drop for Sent<'_> {
     fn drop(&mut self) {
         // A caller that stopped waiting leaves no entry behind for an answer that an
-        // owner stopped for good never sends.
-        if let Some(waiting) = lock(&self.connection.waiting).as_mut() {
-            waiting.remove(&self.id);
+        // owner stopped for good never sends. A commit still unanswered is in doubt
+        // from here on, until its answer comes.
+        if let Some(waiting) = lock(&self.connection.waiting).as_mut()
+            && waiting.callers.remove(&self.id).is_some()
+            && self.commit
+        {
+            waiting.in_doubt.insert(self.id);
         }
     }
 }
@@ -99,7 +116,7 @@ impl Connection {
         let welcome: Welcome = tokio::time::timeout(within, read_frame(&mut reader))
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "no welcome in time"))??;
-        let waiting: Arc<Waiting> = Arc::new(Mutex::new(Some(HashMap::new())));
+        let waiting: Arc<Waiting> = Arc::new(Mutex::new(Some(Unanswered::default())));
         let queued = Arc::new(Queued::default());
         let (frames, to_write) = mpsc::unbounded_channel();
         let connection = Connection {
@@ -129,7 +146,16 @@ impl Connection {
         Ok(Frame {
             id,
             bytes: encode_frame(&(id, request))?,
+            commit: matches!(request, Request::Commit { .. }),
         })
+    }
+
+    /// Whether a commit sent on this connection is in doubt: its caller stopped
+    /// waiting, and the owner has not answered it.
+    pub fn commit_in_doubt(&self) -> bool {
+        lock(&self.waiting)
+            .as_ref()
+            .is_some_and(|waiting| !waiting.in_doubt.is_empty())
     }
 
     /// Queue `frame` once the frames before it leave room, and hand back the wait for
@@ -141,7 +167,7 @@ impl Connection {
         // up cannot leave the room taken and the frame unsent.
         let (answer, answered) = oneshot::channel();
         match lock(&self.waiting).as_mut() {
-            Some(waiting) => waiting.insert(frame.id, answer),
+            Some(waiting) => waiting.callers.insert(frame.id, answer),
             None => {
                 self.give_back(frame.bytes.len());
                 return Err(ended());
@@ -150,6 +176,7 @@ impl Connection {
         let sent = Sent {
             connection: self,
             id: frame.id,
+            commit: frame.commit,
             answered,
         };
         self.push(frame.bytes)?;
@@ -232,7 +259,7 @@ impl Drop for Connection {
     }
 }
 
-fn lock(waiting: &Waiting) -> MutexGuard<'_, Option<Callers>> {
+fn lock(waiting: &Waiting) -> MutexGuard<'_, Option<Unanswered>> {
     waiting.lock().expect("no thread panics holding it")
 }
 
@@ -244,9 +271,11 @@ async fn read_answers(
     queued: Arc<Queued>,
 ) {
     while let Ok((id, answer)) = read_frame::<_, (RequestId, Answer)>(&mut reader).await {
-        let caller = lock(&waiting)
-            .as_mut()
-            .and_then(|waiting| waiting.remove(&id));
+        let caller = lock(&waiting).as_mut().and_then(|waiting| {
+            // An answer nobody waits for settles a commit that was in doubt.
+            waiting.in_doubt.remove(&id);
+            waiting.callers.remove(&id)
+        });
         if let Some(caller) = caller {
             let _ = caller.send(answer);
         }
@@ -287,6 +316,7 @@ mod tests {
 
     use super::*;
     use crate::protocol::{MAX_FRAME, VERSION, Write, write_frame};
+    use crate::types::WireDurability;
 
     /// A connection to a peer that welcomes it and then reads only when told to.
     async fn connection() -> (Connection, UnixStream) {
@@ -357,9 +387,58 @@ mod tests {
         let frame = connection
             .frame(&Request::Rollback { tx: 1 })
             .expect("a frame");
-        let reply = connection.queue(frame).await.expect("queued");
-        assert_eq!(lock(&connection.waiting).as_ref().map(HashMap::len), Some(1));
-        drop(reply);
-        assert_eq!(lock(&connection.waiting).as_ref().map(HashMap::len), Some(0));
+        let callers =
+            || lock(&connection.waiting).as_ref().map(|waiting| waiting.callers.len());
+        let sent = connection.queue(frame).await.expect("queued");
+        assert_eq!(callers(), Some(1));
+        drop(sent);
+        assert_eq!(callers(), Some(0));
+    }
+
+    /// A commit is in doubt from the moment its caller stops waiting until the owner
+    /// answers it; a commit that is waited for is not, and neither is a read that was
+    /// given up on.
+    #[tokio::test]
+    async fn a_commit_its_caller_gave_up_on_is_in_doubt_until_answered() {
+        let (connection, mut theirs) = connection().await;
+        let read = Request::Get {
+            tx: 1,
+            writes: Vec::new(),
+            key: b"k".to_vec(),
+            for_update: false,
+        };
+        let sent = connection
+            .queue(connection.frame(&read).expect("a frame"))
+            .await
+            .expect("queued");
+        drop(sent);
+        assert!(!connection.commit_in_doubt(), "a read is never in doubt");
+
+        let commit = Request::Commit {
+            tx: 1,
+            writes: Vec::new(),
+            durability: WireDurability::Eventual,
+        };
+        let sent = connection
+            .queue(connection.frame(&commit).expect("a frame"))
+            .await
+            .expect("queued");
+        assert!(!connection.commit_in_doubt(), "its caller waits for it");
+        drop(sent);
+        assert!(connection.commit_in_doubt(), "its caller gave up");
+
+        // The owner reads both requests and answers the commit.
+        let _: (RequestId, Request) = read_frame(&mut theirs).await.expect("the read");
+        let (id, _): (RequestId, Request) = read_frame(&mut theirs).await.expect("the commit");
+        write_frame(&mut theirs, &(id, Answer::Committed))
+            .await
+            .expect("an answer");
+        for _ in 0..200 {
+            if !connection.commit_in_doubt() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(!connection.commit_in_doubt(), "the answer settles it");
     }
 }
