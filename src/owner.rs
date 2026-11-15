@@ -8,7 +8,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use surrealkv::{Transaction, Tree};
-use tokio::io::BufReader;
+use tokio::io::{AsyncWriteExt as _, BufReader};
+use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::task::{JoinHandle, JoinSet};
 
@@ -17,8 +18,8 @@ use crate::endpoint::Endpoint;
 use crate::error::KvError;
 use crate::exec::{apply, page};
 use crate::protocol::{
-    Answer, MAX_TRANSACTIONS, Request, RequestId, TxId, VERSION, Welcome, Write, read_frame,
-    write_frame,
+    Answer, MAX_TRANSACTIONS, Request, RequestId, TxId, Unframed, VERSION, Welcome, Write,
+    encode_frame, read_frame, write_frame,
 };
 use crate::types::{WireDurability, WireMode};
 
@@ -198,9 +199,16 @@ async fn serve(
                 continue;
             }
             Request::Rollback { tx } => {
-                if let Some(Slot::Open(mut transaction)) = table.open.remove(&tx) {
+                if let Some(Slot::Open {
+                    mut transaction, ..
+                }) = table.open.remove(&tx)
+                {
                     transaction.rollback();
                 }
+                continue;
+            }
+            Request::Writes { tx, writes } => {
+                table.ahead(tx, writes);
                 continue;
             }
             Request::Get {
@@ -260,7 +268,7 @@ async fn serve(
                             Err(error) => Answer::Failed(error.into()),
                         };
                         // A client that went away learns nothing; the commit stands.
-                        let _ = write_frame(&mut *writer.lock().await, &(id, answer)).await;
+                        let _ = reply(&writer, id, answer).await;
                     });
                     continue;
                 }
@@ -274,16 +282,13 @@ async fn serve(
                         Ok(reply) => Answer::Admin(reply),
                         Err(error) => Answer::Failed(error),
                     };
-                    let _ = write_frame(&mut *writer.lock().await, &(id, answer)).await;
+                    let _ = reply(&writer, id, answer).await;
                 });
                 continue;
             }
         };
         let answer = answer.unwrap_or_else(Answer::Failed);
-        if write_frame(&mut *writer.lock().await, &(id, answer))
-            .await
-            .is_err()
-        {
+        if reply(&writer, id, answer).await.is_err() {
             break;
         }
         while running.try_join_next().is_some() {}
@@ -294,10 +299,29 @@ async fn serve(
     while commits.join_next().await.is_some() {}
 }
 
+/// Write `answer` to request `id` on the client's socket. An answer that no frame holds
+/// becomes the refusal that says so: the client asks for less and keeps its connection.
+async fn reply(
+    writer: &tokio::sync::Mutex<OwnedWriteHalf>,
+    id: RequestId,
+    answer: Answer,
+) -> io::Result<()> {
+    let frame = match encode_frame(&(id, &answer)) {
+        Err(Unframed::TooLong) => encode_frame(&(id, Answer::Failed(KvError::TooLarge)))?,
+        framed => framed?,
+    };
+    writer.lock().await.write_all(&frame).await
+}
+
 /// A transaction of a client, or why it could not begin: the reason comes back on the
 /// client's next request on it.
 enum Slot {
-    Open(Transaction),
+    Open {
+        transaction: Transaction,
+        /// Why writes sent ahead could not be applied: the client's next request on
+        /// the transaction is answered with it.
+        refused: Option<KvError>,
+    },
     Failed(KvError),
 }
 
@@ -317,7 +341,10 @@ impl Table {
             match self.tree.begin_with_mode(mode.mode()) {
                 Ok(mut transaction) => {
                     transaction.set_durability(durability.durability());
-                    Slot::Open(transaction)
+                    Slot::Open {
+                        transaction,
+                        refused: None,
+                    }
                 }
                 Err(error) => Slot::Failed(error.into()),
             }
@@ -333,12 +360,33 @@ impl Table {
         read: impl FnOnce(&mut Transaction) -> surrealkv::Result<Answer>,
     ) -> Result<Answer, KvError> {
         match self.open.get_mut(&tx) {
-            Some(Slot::Open(transaction)) => {
+            Some(Slot::Open {
+                transaction,
+                refused,
+            }) => {
+                if let Some(error) = refused.take() {
+                    return Err(error);
+                }
                 apply(transaction, writes)?;
                 Ok(read(transaction)?)
             }
             Some(Slot::Failed(error)) => Err(error.clone()),
             None => Err(KvError::NoSuchTransaction(tx)),
+        }
+    }
+
+    /// Apply `writes`, which the client sent ahead of its next request on transaction
+    /// `tx`. They have no answer: why they could not be applied is kept for that
+    /// request, and nothing more is applied until it has been told.
+    fn ahead(&mut self, tx: TxId, writes: Vec<Write>) {
+        if let Some(Slot::Open {
+            transaction,
+            refused,
+        }) = self.open.get_mut(&tx)
+            && refused.is_none()
+            && let Err(error) = apply(transaction, writes)
+        {
+            *refused = Some(error.into());
         }
     }
 
@@ -351,7 +399,13 @@ impl Table {
         durability: WireDurability,
     ) -> Result<Transaction, KvError> {
         match self.open.remove(&tx) {
-            Some(Slot::Open(mut transaction)) => {
+            Some(Slot::Open {
+                mut transaction,
+                refused,
+            }) => {
+                if let Some(error) = refused {
+                    return Err(error);
+                }
                 transaction.set_durability(durability.durability());
                 apply(&mut transaction, writes)?;
                 Ok(transaction)
@@ -359,5 +413,61 @@ impl Table {
             Some(Slot::Failed(error)) => Err(error),
             None => Err(KvError::NoSuchTransaction(tx)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Writes a client sent ahead have no answer of their own: when one of them cannot
+    /// be applied, the client's next request on the transaction is answered with the
+    /// reason, once, and nothing was applied after the write that failed.
+    #[tokio::test]
+    async fn writes_sent_ahead_that_fail_answer_the_next_request() {
+        let base = std::env::temp_dir().join(format!("kvo-ahead-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let tree = surrealkv::TreeBuilder::new()
+            .with_path(base.clone())
+            .build()
+            .expect("a tree");
+        let mut table = Table {
+            tree: Arc::new(tree),
+            open: HashMap::new(),
+        };
+        table.begin(1, WireMode::ReadWrite, WireDurability::Eventual);
+        table.ahead(
+            1,
+            vec![
+                Write::Set {
+                    key: b"a".to_vec(),
+                    value: b"1".to_vec(),
+                },
+                // No savepoint was set: SurrealKV refuses it.
+                Write::RollbackToSavepoint,
+                Write::Set {
+                    key: b"b".to_vec(),
+                    value: b"2".to_vec(),
+                },
+            ],
+        );
+        let read = |key: &'static [u8]| {
+            move |transaction: &mut Transaction| Ok(Answer::Got(transaction.get(key)?))
+        };
+        assert_eq!(
+            table.on(1, Vec::new(), read(b"a")).err(),
+            Some(KvError::TransactionWithoutSavepoint),
+            "the next request learns why the writes were refused"
+        );
+        assert!(
+            matches!(table.on(1, Vec::new(), read(b"a")), Ok(Answer::Got(Some(_)))),
+            "the write before the refused one was applied"
+        );
+        assert!(
+            matches!(table.on(1, Vec::new(), read(b"b")), Ok(Answer::Got(None))),
+            "the write after it was not"
+        );
+        drop(table);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

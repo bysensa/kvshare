@@ -18,11 +18,17 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::protocol::{Answer, Request, RequestId, Welcome, encode_frame, read_frame};
+use crate::protocol::{Answer, Request, RequestId, Unframed, Welcome, encode_frame, read_frame};
 
 /// Why a request got no answer: the connection to the owner is gone.
 #[derive(Debug)]
 pub struct Lost(pub String);
+
+/// A request as its frame, under the id its answer will carry; not sent yet.
+pub struct Frame {
+    id: RequestId,
+    bytes: Vec<u8>,
+}
 
 /// The callers waiting for an answer, by request id.
 type Callers = HashMap<RequestId, oneshot::Sender<Answer>>;
@@ -61,35 +67,40 @@ impl Connection {
         Ok((connection, welcome))
     }
 
-    /// Send `request` and wait for its answer. Dropping the returned future stops the
-    /// wait, not the request: it reaches the owner whole.
-    pub async fn call(&self, request: Request) -> Result<Answer, Lost> {
+    /// The frame of `request`, under a new id. Nothing is sent: a request that no frame
+    /// holds is known here, while its transaction can still take its writes back.
+    pub fn frame(&self, request: &Request) -> Result<Frame, Unframed> {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
+        Ok(Frame {
+            id,
+            bytes: encode_frame(&(id, request))?,
+        })
+    }
+
+    /// Send `frame` and wait for its answer. Dropping the returned future stops the
+    /// wait, not the request: it reaches the owner whole.
+    pub async fn call(&self, frame: Frame) -> Result<Answer, Lost> {
         let (answer, answered) = oneshot::channel();
         match lock(&self.waiting).as_mut() {
-            Some(waiting) => waiting.insert(id, answer),
+            Some(waiting) => waiting.insert(frame.id, answer),
             None => return Err(ended()),
         };
-        if let Err(lost) = self.queue(id, &request) {
+        if self.frames.send(frame.bytes).is_err() {
             if let Some(waiting) = lock(&self.waiting).as_mut() {
-                waiting.remove(&id);
+                waiting.remove(&frame.id);
             }
-            return Err(lost);
+            return Err(ended());
         }
         answered.await.map_err(|_| ended())
     }
 
     /// Send `request`, which has no answer, without waiting. It needs no runtime: a
     /// transaction dropped on any thread rolls back through it.
-    pub fn send(&self, request: Request) -> Result<(), Lost> {
-        let id = self.next.fetch_add(1, Ordering::Relaxed);
-        self.queue(id, &request)
-    }
-
-    /// Queue the frame of `request` for the writer.
-    fn queue(&self, id: RequestId, request: &Request) -> Result<(), Lost> {
-        let frame = encode_frame(&(id, request)).map_err(|error| Lost(error.to_string()))?;
-        self.frames.send(frame).map_err(|_| ended())
+    pub fn tell(&self, request: &Request) -> Result<(), Lost> {
+        let frame = self
+            .frame(request)
+            .map_err(|unframed| Lost(io::Error::from(unframed).to_string()))?;
+        self.frames.send(frame.bytes).map_err(|_| ended())
     }
 }
 

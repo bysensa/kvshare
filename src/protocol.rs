@@ -39,13 +39,23 @@ use crate::error::KvError;
 use crate::types::{WireDurability, WireMode};
 
 /// The version of the protocol. Bump it when a message would mean something else.
-pub const VERSION: u32 = 7;
+pub const VERSION: u32 = 8;
 
 /// How many transactions one connection may hold open at once.
 pub const MAX_TRANSACTIONS: usize = 64;
 
-/// The largest frame either side accepts: a longer one is a broken peer.
-pub const MAX_FRAME: u32 = 64 << 20;
+/// The most a key and its value hold together, in bytes: more is refused when it is
+/// written, by an owner and by a client alike, so that every entry crosses the socket in
+/// one frame whichever process owns the database.
+pub const MAX_ENTRY: usize = 64 << 20;
+
+/// The largest frame either side accepts: an entry of the greatest size and room for
+/// what travels with it. A longer one is a broken peer.
+pub const MAX_FRAME: u32 = (MAX_ENTRY + (1 << 20)) as u32;
+
+/// How many bytes of writes a client's transaction keeps at most before it sends them
+/// ahead of its next request, so that a transaction may write more than a frame holds.
+pub const WRITES_AHEAD: usize = 4 << 20;
 
 /// How many entries a page of a client's cursor holds unless the cursor asks for another
 /// number.
@@ -117,6 +127,24 @@ pub(crate) enum Write {
     },
     SetSavepoint,
     RollbackToSavepoint,
+}
+
+impl Write {
+    /// The bytes of the keys and the value the write carries.
+    pub(crate) fn bytes(&self) -> usize {
+        match self {
+            Write::Set { key, value }
+            | Write::SetAt { key, value, .. }
+            | Write::SetWithOptions { key, value, .. }
+            | Write::Replace { key, value } => key.len() + value.len(),
+            Write::Delete { key }
+            | Write::DeleteWithOptions { key, .. }
+            | Write::SoftDelete { key }
+            | Write::SoftDeleteWithOptions { key, .. } => key.len(),
+            Write::DeleteRange { start, end } => start.len() + end.len(),
+            Write::SetSavepoint | Write::RollbackToSavepoint => 0,
+        }
+    }
 }
 
 /// What a cursor reads: SurrealKV's `range_with_options` or `history_with_options`.
@@ -299,6 +327,27 @@ pub(crate) enum Request {
     Rollback { tx: TxId },
     /// An operation on the whole database.
     Admin(Admin),
+    /// Writes of transaction `tx` sent ahead of its next request, which the owner
+    /// applies in their order. It has no answer: why they could not be applied comes
+    /// back on the next request on `tx`.
+    Writes { tx: TxId, writes: Vec<Write> },
+}
+
+impl Request {
+    /// Take the writes the request carries and leave it none: a request that is not
+    /// sent gives them back to its transaction.
+    pub(crate) fn take_writes(&mut self) -> Vec<Write> {
+        match self {
+            Request::Get { writes, .. }
+            | Request::GetMany { writes, .. }
+            | Request::GetAt { writes, .. }
+            | Request::GetManyAt { writes, .. }
+            | Request::Cursor { writes, .. }
+            | Request::Commit { writes, .. }
+            | Request::Writes { writes, .. } => std::mem::take(writes),
+            Request::Begin { .. } | Request::Rollback { .. } | Request::Admin(_) => Vec::new(),
+        }
+    }
 }
 
 /// What the owner answers a request.
@@ -326,13 +375,32 @@ where
     writer.write_all(&encode_frame(message)?).await
 }
 
+/// Why a message did not become a frame.
+#[derive(Debug)]
+pub(crate) enum Unframed {
+    /// It is longer than [`MAX_FRAME`].
+    TooLong,
+    Encoding(postcard::Error),
+}
+
+impl From<Unframed> for io::Error {
+    fn from(unframed: Unframed) -> Self {
+        match unframed {
+            Unframed::TooLong => {
+                io::Error::new(io::ErrorKind::InvalidInput, "the message is too long")
+            }
+            Unframed::Encoding(error) => io::Error::other(error),
+        }
+    }
+}
+
 /// `message` as one frame: its length, then the message.
-pub(crate) fn encode_frame<T: Serialize>(message: &T) -> io::Result<Vec<u8>> {
-    let mut frame = postcard::to_extend(message, vec![0u8; 4]).map_err(io::Error::other)?;
+pub(crate) fn encode_frame<T: Serialize>(message: &T) -> Result<Vec<u8>, Unframed> {
+    let mut frame = postcard::to_extend(message, vec![0u8; 4]).map_err(Unframed::Encoding)?;
     let length = u32::try_from(frame.len() - 4)
         .ok()
         .filter(|length| *length <= MAX_FRAME)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "the message is too long"))?;
+        .ok_or(Unframed::TooLong)?;
     frame[..4].copy_from_slice(&length.to_le_bytes());
     Ok(frame)
 }

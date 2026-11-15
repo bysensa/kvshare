@@ -13,7 +13,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use surrealkv::WriteStallReason;
 
-use crate::protocol::TxId;
+use crate::protocol::{TxId, Unframed};
 
 /// Why an operation failed.
 #[derive(Debug)]
@@ -38,6 +38,10 @@ pub enum Error {
     },
     /// Any other SurrealKV error, as SurrealKV words it.
     Engine(String),
+    /// A key with its value holds more than [`MAX_ENTRY`](crate::MAX_ENTRY) bytes, or a
+    /// request or its answer is larger than one frame of the owner's socket. Nothing
+    /// was written or sent, and the transaction works on.
+    TooLarge(String),
     /// The owner already holds as many open transactions of this process as it allows.
     TooManyTransactions,
     /// The owner went away during the operation; for a commit, whether it happened is
@@ -80,6 +84,7 @@ impl fmt::Display for Error {
             Error::InvalidArgument(reason) => write!(f, "invalid argument: {reason}"),
             Error::WriteStall { reason } => write!(f, "write stall: {reason:?}"),
             Error::Engine(reason) => write!(f, "SurrealKV: {reason}"),
+            Error::TooLarge(what) => write!(f, "too large: {what}"),
             Error::TooManyTransactions => write!(f, "too many open transactions"),
             Error::OwnerLost(reason) => write!(f, "the owner went away: {reason}"),
             Error::OwnerSilent { pid, waited } => {
@@ -123,6 +128,8 @@ pub(crate) enum KvError {
     /// The connection holds no transaction with this number: a client out of step with
     /// its owner.
     NoSuchTransaction(TxId),
+    /// The answer is larger than one frame.
+    TooLarge,
 }
 
 impl From<surrealkv::Error> for KvError {
@@ -173,6 +180,22 @@ impl From<KvError> for Error {
             KvError::TooManyTransactions => Error::TooManyTransactions,
             KvError::NoSuchTransaction(tx) => {
                 Error::Handshake(format!("the owner holds no transaction {tx}"))
+            }
+            KvError::TooLarge => {
+                Error::TooLarge("the answer does not fit one frame of the owner's socket".into())
+            }
+        }
+    }
+}
+
+impl From<Unframed> for Error {
+    fn from(unframed: Unframed) -> Self {
+        match unframed {
+            Unframed::TooLong => {
+                Error::TooLarge("the request does not fit one frame of the owner's socket".into())
+            }
+            Unframed::Encoding(error) => {
+                Error::InvalidArgument(format!("the request could not be encoded: {error}"))
             }
         }
     }

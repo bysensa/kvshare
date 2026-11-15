@@ -33,7 +33,9 @@ use crate::election::{Current, Role, connect};
 use crate::endpoint::Endpoint;
 use crate::error::{Error, Result};
 use crate::exec::{open, page};
-use crate::protocol::{Answer, At, Item, Request, Source, TxId, Write};
+use crate::protocol::{
+    Answer, At, Item, MAX_ENTRY, Request, Source, TxId, WRITES_AHEAD, Write,
+};
 use crate::types::{KeyRange, ReadOptions, WireDurability, WireMode, fingerprint};
 
 /// Builds a [`Tree`], as SurrealKV's `TreeBuilder` does, with the same options; and the
@@ -375,7 +377,7 @@ impl Tree {
                     mode: wire_mode,
                     durability: WireDurability::Eventual,
                 };
-                if let Err(Lost(reason)) = connection.send(begin) {
+                if let Err(Lost(reason)) = connection.tell(&begin) {
                     self.inner.forget(generation).await;
                     return Err(Error::OwnerLost(reason));
                 }
@@ -387,7 +389,7 @@ impl Tree {
                     durability: Durability::Eventual,
                     closed: false,
                     savepoints: 0,
-                    pending: tokio::sync::Mutex::new(Vec::new()),
+                    pending: tokio::sync::Mutex::new(Pending::default()),
                 };
                 (generation, State::Remote(remote))
             }
@@ -563,7 +565,7 @@ impl Tree {
                 generation,
             } => {
                 let within = (!admin.takes_long()).then_some(self.inner.call_within);
-                let call = connection.call(Request::Admin(admin));
+                let call = connection.call(connection.frame(&Request::Admin(admin))?);
                 match self.inner.wait(generation, owner_pid, call, within).await? {
                     Answer::Admin(reply) => Ok(reply),
                     other => Err(out_of_turn(other)),
@@ -606,7 +608,41 @@ struct Remote {
     /// The writes the owner has not had yet, in their order. Every read takes them to
     /// the owner, holding the lock until its answer, so they reach the owner before any
     /// read the transaction makes after them.
-    pending: tokio::sync::Mutex<Vec<Write>>,
+    pending: tokio::sync::Mutex<Pending>,
+}
+
+/// The writes of a client's transaction that the owner has not had yet, in their order,
+/// and the bytes they hold.
+#[derive(Default)]
+struct Pending {
+    writes: Vec<Write>,
+    bytes: usize,
+}
+
+impl Pending {
+    fn take(&mut self) -> Vec<Write> {
+        self.bytes = 0;
+        std::mem::take(&mut self.writes)
+    }
+
+    /// Take back `writes`, which were not sent: they come before any made since.
+    fn put_back(&mut self, mut writes: Vec<Write>) {
+        self.bytes += writes.iter().map(Write::bytes).sum::<usize>();
+        writes.append(&mut self.writes);
+        self.writes = writes;
+    }
+}
+
+/// Refuse an entry that holds more than [`MAX_ENTRY`] bytes. In a client it would not
+/// cross the socket; an owner refuses it too, so that what a process may write does not
+/// turn on the role it happens to hold.
+fn fits(bytes: usize) -> Result<()> {
+    if bytes > MAX_ENTRY {
+        return Err(Error::TooLarge(format!(
+            "an entry of {bytes} bytes; a key and its value hold at most {MAX_ENTRY}"
+        )));
+    }
+    Ok(())
 }
 
 impl Remote {
@@ -637,8 +673,26 @@ impl Remote {
         Ok(())
     }
 
+    /// Keep `write` for the transaction's next request. Writes that would make that
+    /// request carry more than [`WRITES_AHEAD`] are sent ahead of it first, in a frame
+    /// of their own, so a transaction may write more than a frame holds. One write, of
+    /// any size an entry may have, waits for the request alone.
     fn push(&mut self, write: Write) {
-        self.pending.get_mut().push(write);
+        let bytes = write.bytes();
+        let pending = self.pending.get_mut();
+        if !pending.writes.is_empty() && pending.bytes + bytes > WRITES_AHEAD {
+            let mut ahead = Request::Writes {
+                tx: self.id,
+                writes: pending.take(),
+            };
+            // A connection that is gone takes nothing: the writes stay, and the
+            // transaction's next request says the owner is lost.
+            if self.connection.tell(&ahead).is_err() {
+                pending.put_back(ahead.take_writes());
+            }
+        }
+        pending.writes.push(write);
+        pending.bytes += bytes;
     }
 
     /// Send a read of this transaction with the writes it has kept, and wait for the
@@ -655,10 +709,20 @@ impl Remote {
         // The lock is held until the answer: a read that took no writes must not
         // overtake, on the socket, the read that took them.
         let mut pending = self.pending.lock().await;
-        let call = self
-            .connection
-            .call(request(self.id, std::mem::take(&mut *pending)));
-        inner.call(generation, self.owner_pid, call).await
+        let mut request = request(self.id, pending.take());
+        // A request that no frame holds is not sent, and the writes it would have
+        // carried stay the transaction's.
+        let frame = match self.connection.frame(&request) {
+            Ok(frame) => frame,
+            Err(unframed) => {
+                pending.put_back(request.take_writes());
+                return Err(unframed.into());
+            }
+        };
+        drop(request);
+        inner
+            .call(generation, self.owner_pid, self.connection.call(frame))
+            .await
     }
 }
 
@@ -681,6 +745,7 @@ impl Transaction {
     }
 
     pub fn set<K: IntoBytes, V: IntoBytes>(&mut self, key: K, value: V) -> Result<()> {
+        fits(key.as_slice().len() + value.as_slice().len())?;
         match &mut self.state {
             State::Local(transaction) => Ok(transaction.set(key, value)?),
             State::Remote(remote) => {
@@ -700,6 +765,7 @@ impl Transaction {
         value: V,
         timestamp: u64,
     ) -> Result<()> {
+        fits(key.as_slice().len() + value.as_slice().len())?;
         match &mut self.state {
             State::Local(transaction) => Ok(transaction.set_at(key, value, timestamp)?),
             State::Remote(remote) => {
@@ -720,6 +786,7 @@ impl Transaction {
         value: V,
         options: &WriteOptions,
     ) -> Result<()> {
+        fits(key.as_slice().len() + value.as_slice().len())?;
         match &mut self.state {
             State::Local(transaction) => Ok(transaction.set_with_options(key, value, options)?),
             State::Remote(remote) => {
@@ -736,6 +803,7 @@ impl Transaction {
 
     /// A hard delete, as SurrealKV's: the key's history goes with it.
     pub fn delete<K: IntoBytes>(&mut self, key: K) -> Result<()> {
+        fits(key.as_slice().len())?;
         match &mut self.state {
             State::Local(transaction) => Ok(transaction.delete(key)?),
             State::Remote(remote) => {
@@ -753,6 +821,7 @@ impl Transaction {
         key: K,
         options: &WriteOptions,
     ) -> Result<()> {
+        fits(key.as_slice().len())?;
         match &mut self.state {
             State::Local(transaction) => Ok(transaction.delete_with_options(key, options)?),
             State::Remote(remote) => {
@@ -767,6 +836,7 @@ impl Transaction {
     }
 
     pub fn delete_range<K: IntoBytes>(&mut self, start: K, end: K) -> Result<()> {
+        fits(start.as_slice().len() + end.as_slice().len())?;
         match &mut self.state {
             State::Local(transaction) => Ok(transaction.delete_range(start, end)?),
             State::Remote(remote) => {
@@ -787,6 +857,7 @@ impl Transaction {
 
     /// A tombstone, as SurrealKV's `soft_delete`: the key's history stays.
     pub fn soft_delete<K: IntoBytes>(&mut self, key: K) -> Result<()> {
+        fits(key.as_slice().len())?;
         match &mut self.state {
             State::Local(transaction) => Ok(transaction.soft_delete(key)?),
             State::Remote(remote) => {
@@ -804,6 +875,7 @@ impl Transaction {
         key: K,
         options: &WriteOptions,
     ) -> Result<()> {
+        fits(key.as_slice().len())?;
         match &mut self.state {
             State::Local(transaction) => Ok(transaction.soft_delete_with_options(key, options)?),
             State::Remote(remote) => {
@@ -818,6 +890,7 @@ impl Transaction {
     }
 
     pub fn replace<K: IntoBytes, V: IntoBytes>(&mut self, key: K, value: V) -> Result<()> {
+        fits(key.as_slice().len() + value.as_slice().len())?;
         match &mut self.state {
             State::Local(transaction) => Ok(transaction.replace(key, value)?),
             State::Remote(remote) => {
@@ -960,12 +1033,7 @@ impl Transaction {
             State::Local(transaction) => Ok(transaction.get_many(keys)?),
             State::Remote(remote) => {
                 let keys = keys.iter().map(|key| key.as_slice().to_vec()).collect();
-                let answer = remote
-                    .ask(&self.inner, self.generation, |tx, writes| {
-                        Request::GetMany { tx, writes, keys }
-                    })
-                    .await?;
-                got_many(answer)
+                self.many(remote, keys, None).await
             }
         }
     }
@@ -995,17 +1063,7 @@ impl Transaction {
             State::Local(transaction) => Ok(transaction.get_many_at(keys, timestamp)?),
             State::Remote(remote) => {
                 let keys = keys.iter().map(|key| key.as_slice().to_vec()).collect();
-                let answer = remote
-                    .ask(&self.inner, self.generation, |tx, writes| {
-                        Request::GetManyAt {
-                            tx,
-                            writes,
-                            keys,
-                            timestamp,
-                        }
-                    })
-                    .await?;
-                got_many(answer)
+                self.many(remote, keys, Some(timestamp)).await
             }
         }
     }
@@ -1024,6 +1082,48 @@ impl Transaction {
                 Ok(())
             }
         }
+    }
+
+    /// `get_many`, or `get_many_at` with a `timestamp`, through the owner. Keys whose
+    /// request or whose values no frame holds are asked for again as their two halves:
+    /// a read can be repeated, and the transaction's snapshot answers the same.
+    async fn many(
+        &self,
+        remote: &Remote,
+        keys: Vec<Vec<u8>>,
+        timestamp: Option<u64>,
+    ) -> Result<Vec<Option<Value>>> {
+        let mut values = Vec::with_capacity(keys.len());
+        // The ranges of `keys` still to ask for, the next one last.
+        let mut parts = vec![0..keys.len()];
+        while let Some(part) = parts.pop() {
+            let asked = keys[part.clone()].to_vec();
+            let answer = remote
+                .ask(&self.inner, self.generation, |tx, writes| match timestamp {
+                    None => Request::GetMany {
+                        tx,
+                        writes,
+                        keys: asked,
+                    },
+                    Some(timestamp) => Request::GetManyAt {
+                        tx,
+                        writes,
+                        keys: asked,
+                        timestamp,
+                    },
+                })
+                .await;
+            match answer {
+                Ok(answer) => values.extend(got_many(answer)?),
+                Err(Error::TooLarge(_)) if part.len() > 1 => {
+                    let middle = part.start + part.len() / 2;
+                    parts.push(middle..part.end);
+                    parts.push(part.start..middle);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(values)
     }
 
     /// A cursor over every key, as this transaction sees it.
@@ -1120,13 +1220,22 @@ impl Transaction {
                 // Refused before the transaction closes, so that dropping it still rolls
                 // it back in the owner.
                 let durability = WireDurability::of(remote.durability)?;
-                remote.closed = true;
-                let request = Request::Commit {
+                let mut request = Request::Commit {
                     tx: remote.id,
-                    writes: std::mem::take(remote.pending.get_mut()),
+                    writes: remote.pending.get_mut().take(),
                     durability,
                 };
-                let call = remote.connection.call(request);
+                // A commit that no frame holds is not sent either: the transaction
+                // stays open, with its writes.
+                let frame = match remote.connection.frame(&request) {
+                    Ok(frame) => frame,
+                    Err(unframed) => {
+                        remote.pending.get_mut().put_back(request.take_writes());
+                        return Err(unframed.into());
+                    }
+                };
+                remote.closed = true;
+                let call = remote.connection.call(frame);
                 match inner.call(generation, remote.owner_pid, call).await? {
                     Answer::Committed => Ok(()),
                     other => Err(out_of_turn(other)),
@@ -1140,7 +1249,7 @@ impl Transaction {
             State::Local(transaction) => transaction.rollback(),
             State::Remote(remote) => {
                 remote.savepoints = 0;
-                remote.pending.get_mut().clear();
+                remote.pending.get_mut().take();
                 if !std::mem::replace(&mut remote.closed, true) {
                     end_in_owner(remote);
                 }
@@ -1197,7 +1306,7 @@ impl Drop for Transaction {
 /// Roll the transaction back in the owner without waiting, from whatever thread drops
 /// it. An owner that is gone has rolled it back already.
 fn end_in_owner(remote: &Remote) {
-    let _ = remote.connection.send(Request::Rollback { tx: remote.id });
+    let _ = remote.connection.tell(&Request::Rollback { tx: remote.id });
 }
 
 fn got(answer: Answer) -> Result<Option<Value>> {
