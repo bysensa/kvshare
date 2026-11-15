@@ -284,6 +284,12 @@ leaves once it is done. Checkpoints and compactions do not hold up commits meanw
 commits of 200 bytes kept a p99 under 1 ms (78 ms at most) during a checkpoint and a
 compaction of the whole tree of 11.8 s.
 
+In `kv-sim`, where a keeper checkpoints every 5 s and compacts the whole tree every
+10 s, none of the 96 hooks that owned the database and closed it in 10 minutes waited
+for one: their close took 52 ms at the median and 75 ms at most. A process owns the
+database for a moment and is rarely asked meanwhile; still, a process that runs
+maintenance does better to run it rarely and over small ranges, as a close waits for it.
+
 ### What history and the value log cost
 
 SurrealKV 1.4.0 gives back the space of the value log a whole file at a time, and only

@@ -53,9 +53,18 @@ pub async fn run(run: PathBuf, seed: u64, event: u64) -> Result<(), String> {
         let mut transition = TransitionOp::new(event % TASKS, By::Hook, ctx.rng.next_u64());
         ctx.perform("transition", &mut transition).await;
     }
-    // Half the hooks let the database go; the others end as a process does.
+    // Half the hooks let the database go, and time it: an owner that leaves waits for the
+    // work under way in it. The others end as a process does. (The role is the one the
+    // hook opened with; one that became the owner on the way shows as a long close of a
+    // client.)
     if ctx.rng.chance(50) {
+        let closing = Instant::now();
         let _ = ctx.tree.close().await;
+        ctx.journal.time(
+            "hook.close",
+            closing.elapsed().as_micros(),
+            if owner { "owner" } else { "client" },
+        );
     }
     ctx.journal.time(
         "hook.total",

@@ -4,6 +4,7 @@
 //! against the journals and prints the report.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -193,7 +194,11 @@ pub async fn run(settings: Settings) -> Result<(), String> {
                         pid,
                         spawned,
                         took: spawned.elapsed(),
-                        ok: status.is_ok_and(|s| s.success()),
+                        end: match status {
+                            Ok(status) if status.success() => End::Done,
+                            Ok(status) if status.signal().is_some() => End::Killed,
+                            _ => End::Failed,
+                        },
                     }
                 });
             }
@@ -321,7 +326,7 @@ pub async fn run(settings: Settings) -> Result<(), String> {
             } else {
                 When::Calm
             };
-            (hook.took, hook.ok, when)
+            (hook.took, hook.end, when)
         })
         .collect();
     let run = Run {
@@ -350,13 +355,22 @@ pub async fn run(settings: Settings) -> Result<(), String> {
     }
 }
 
-/// A hook as the conductor saw it: its pid, when it started, how long it ran, whether it
-/// ended well.
+/// A hook as the conductor saw it: its pid, when it started, how long it ran, how it
+/// ended.
 struct HookRun {
     pid: u32,
     spawned: Instant,
     took: Duration,
-    ok: bool,
+    end: End,
+}
+
+/// How a hook ended: well, killed by a signal (the conductor's), or with an error,
+/// which it wrote to `logs/hook.err`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum End {
+    Done,
+    Killed,
+    Failed,
 }
 
 /// How long the hooks still running at the run's end may take to end.

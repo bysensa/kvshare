@@ -9,16 +9,16 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::check::Finding;
-use crate::conductor::{HOOK_BUDGET, LOW_DISK, Sample, When};
+use crate::conductor::{End, HOOK_BUDGET, LOW_DISK, Sample, When};
 use crate::journal::Journals;
 
 /// What the conductor saw of a run.
 pub struct Run {
     pub seed: u64,
     pub elapsed: Duration,
-    /// Each hook's time from its start to its exit, whether it ended well, and what the
-    /// owner went through meanwhile.
-    pub hook_times: Vec<(Duration, bool, When)>,
+    /// Each hook's time from its start to its exit, how it ended, and what the owner went
+    /// through meanwhile.
+    pub hook_times: Vec<(Duration, End, When)>,
     pub counts: HashMap<&'static str, u64>,
     pub samples: HashMap<u32, Vec<Sample>>,
     /// The least free space on the run's disk the conductor saw, in bytes.
@@ -110,6 +110,31 @@ fn size(path: &Path) -> u64 {
     }
 }
 
+/// The errors the hooks that failed wrote to `logs/hook.err`, by kind: the text with its
+/// pid and numbers left out, and how many times it came.
+fn hook_errors(dir: &Path) {
+    let Ok(text) = std::fs::read_to_string(dir.join("logs").join("hook.err")) else {
+        return;
+    };
+    let mut kinds: HashMap<String, u64> = HashMap::new();
+    for line in text.lines() {
+        // `kv-sim <pid>: <error>`, its numbers made `N` so that one kind counts as one.
+        let error = line.split_once(": ").map_or(line, |(_, error)| error);
+        let kind: String = error
+            .split(|c: char| c.is_ascii_digit())
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("N");
+        *kinds.entry(kind).or_default() += 1;
+    }
+    let mut kinds: Vec<(String, u64)> = kinds.into_iter().collect();
+    kinds.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+    println!("hook errors (logs/hook.err):");
+    for (kind, count) in kinds {
+        println!("  {count:>6}  {kind}");
+    }
+}
+
 /// Print the report; whether the run failed.
 pub fn print(dir: &Path, run: &Run, found: &[Finding]) -> Result<bool, String> {
     let journals = Journals::read(dir).map_err(|e| e.to_string())?;
@@ -130,18 +155,19 @@ pub fn print(dir: &Path, run: &Run, found: &[Finding]) -> Result<bool, String> {
     );
     let mut p99 = 0;
     for when in [When::Calm, When::OwnerKilled, When::OwnerStopped] {
-        let of: Vec<&(Duration, bool, When)> = run
+        let of: Vec<&(Duration, End, When)> = run
             .hook_times
             .iter()
             .filter(|(_, _, w)| *w == when)
             .collect();
         let micros: Vec<u128> = of.iter().map(|(d, _, _)| d.as_micros()).collect();
-        let failed = of.iter().filter(|(_, ok, _)| !ok).count();
+        let ended = |end: End| of.iter().filter(|(_, e, _)| *e == end).count();
         println!(
-            "  {:<14} {:>5} hooks, {:>4} failed: {}",
+            "  {:<14} {:>5} hooks, {:>4} killed, {:>4} failed: {}",
             format!("{when:?}"),
             micros.len(),
-            failed,
+            ended(End::Killed),
+            ended(End::Failed),
             spread(micros.clone())
         );
         if when == When::Calm {
@@ -153,25 +179,32 @@ pub fn print(dir: &Path, run: &Run, found: &[Finding]) -> Result<bool, String> {
                 .unwrap_or(0);
         }
     }
-    for (name, split) in [("hook.open", "owner"), ("hook.open", "client")] {
+    for (name, split) in [
+        ("hook.open", "owner"),
+        ("hook.open", "client"),
+        ("hook.close", "owner"),
+        ("hook.close", "client"),
+    ] {
         if let Some(times) = journals.times.get(name) {
             let of: Vec<u128> = times
                 .iter()
                 .filter(|(_, e)| e == split)
                 .map(|(t, _)| u128::from(*t))
                 .collect();
+            let what = name.trim_start_matches("hook.");
             println!(
-                "  open as {split}: {} ({} hooks)",
+                "  {what} as {split}: {} ({} hooks)",
                 spread(of.clone()),
                 of.len()
             );
         }
     }
+    hook_errors(dir);
 
     let mut names: Vec<&String> = journals
         .times
         .keys()
-        .filter(|n| *n != "hook.open")
+        .filter(|n| *n != "hook.open" && *n != "hook.close")
         .collect();
     names.sort();
     println!("timings (p50 p99 max):");
