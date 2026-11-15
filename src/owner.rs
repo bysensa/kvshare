@@ -13,7 +13,7 @@ use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::task::{JoinHandle, JoinSet};
 
-use crate::admin::{Maintenance, run_blocking};
+use crate::admin::{Admin, Maintenance, run_blocking};
 use crate::endpoint::{Endpoint, same_user};
 use crate::error::KvError;
 use crate::exec::{apply, many, page};
@@ -34,6 +34,8 @@ pub(crate) struct Owner {
     socket: PathBuf,
     /// The file in the database's directory that names the socket.
     pointer: PathBuf,
+    /// Whether closing the tree writes its memtable out, as the tree's options say.
+    flush_on_close: bool,
     accept: JoinHandle<()>,
 }
 
@@ -42,6 +44,7 @@ impl Owner {
     /// to the processes of the user `uid`, in frames of `max_frame` bytes at most,
     /// telling each client the `fingerprint` of the options it opened the tree with;
     /// and leave the socket's path in the database's directory for them.
+    /// `flush_on_close` is the tree's option of that name.
     ///
     /// Only the holder of the database's lock calls this, so a socket file found at
     /// the path was left by an owner that is gone, and it is removed without asking.
@@ -52,6 +55,7 @@ impl Owner {
         fingerprint: [u8; 32],
         uid: u32,
         max_frame: u32,
+        flush_on_close: bool,
     ) -> io::Result<Owner> {
         if let Some(dir) = endpoint.socket.parent() {
             // A directory made here is for this user only. One that is there already
@@ -90,6 +94,7 @@ impl Owner {
             maintenance,
             socket: endpoint.socket.clone(),
             pointer: endpoint.pointer(),
+            flush_on_close,
             accept,
         })
     }
@@ -112,8 +117,14 @@ impl Owner {
         self.tree.abandon();
     }
 
-    /// Hand the database over: stop serving, wait for the operations on the whole
-    /// database that run, remove the socket and close the tree.
+    /// Hand the database over: write the memtable out, stop serving, wait for the
+    /// operations on the whole database that run, remove the socket and close the tree.
+    ///
+    /// Writing the memtable out is most of what leaving takes, and the owner serves
+    /// through it: its clients' requests are answered, and a process that is waiting
+    /// for an owner finds one. An owner that hung up first left them all an election;
+    /// and when the owners are processes that each live a moment, as hooks do, a row
+    /// of them served nobody for seconds, each leaving as soon as it had come.
     ///
     /// The clients lose their connections, their open transactions are rolled back,
     /// and they elect the next owner once the lock is released. A compaction under way
@@ -121,7 +132,20 @@ impl Owner {
     /// tree closed.
     pub(crate) async fn close(mut self) -> Result<(), surrealkv::Error> {
         let started = std::time::Instant::now();
+        if self.flush_on_close {
+            // SurrealKV's own flush is not public: a compaction that flushes and then
+            // compacts no level is one. A failure is the close's to tell.
+            let flush = Admin::CompactRange {
+                start: None,
+                end: None,
+                flush_memtable: true,
+                target_level: Some(0),
+                rewrite_bottommost: false,
+            };
+            let _ = run_blocking(Arc::clone(&self.tree), &self.maintenance, flush).await;
+        }
         // Aborting the accept task drops its set of connections, which aborts them.
+        let hung_up = std::time::Instant::now();
         self.accept.abort();
         let _ = (&mut self.accept).await;
         let _quiet = self.maintenance.write().await;
@@ -129,7 +153,11 @@ impl Owner {
         let _ = std::fs::remove_file(&self.pointer);
         let _ = std::fs::remove_file(&self.socket);
         let closed = self.tree.close().await;
-        tracing::info!(took = ?started.elapsed(), "handed the database over");
+        tracing::info!(
+            took = ?started.elapsed(),
+            silent = ?hung_up.elapsed(),
+            "handed the database over"
+        );
         closed
     }
 }
@@ -557,7 +585,7 @@ mod versions {
             .build()
             .expect("a tree");
         let me = crate::endpoint::uid().expect("this process's user");
-        let owner = Owner::start(tree, &endpoint, [0; 32], me, LIMIT).expect("an owner");
+        let owner = Owner::start(tree, &endpoint, [0; 32], me, LIMIT, true).expect("an owner");
 
         let mut stranger = UnixStream::connect(&endpoint.socket)
             .await

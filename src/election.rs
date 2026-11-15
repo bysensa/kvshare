@@ -66,16 +66,30 @@ impl Inner {
     /// Open the database and own it, or connect to the process that does.
     async fn elect(&self) -> Result<Role> {
         let started = Instant::now();
+        // How many times the database was tried, and why the last try did not reach
+        // its owner: what a process that finds no owner in time has to tell.
+        let mut attempts = 0u32;
+        let mut last: String;
         loop {
+            attempts += 1;
+            let opening = Instant::now();
             match open(&self.options).await {
                 Ok(tree) => {
+                    let opened = opening.elapsed();
                     let frame = max_frame(self.max_entry);
-                    let owner =
-                        Owner::start(tree, &self.endpoint, self.fingerprint, self.uid, frame)
-                            .map_err(Error::Io)?;
+                    let owner = Owner::start(
+                        tree,
+                        &self.endpoint,
+                        self.fingerprint,
+                        self.uid,
+                        frame,
+                        self.options.flush_on_close,
+                    )
+                    .map_err(Error::Io)?;
                     tracing::info!(
                         db = %self.endpoint.db.display(),
                         socket = %self.endpoint.socket.display(),
+                        opened = ?opened,
                         "owns the database"
                     );
                     return Ok(Role::Owner(owner));
@@ -102,6 +116,7 @@ impl Inner {
                         // The owner is on its way in or out: open again after a pause.
                         Err(Error::Io(error)) if passing(&error) => {
                             tracing::debug!(%error, "the owner is on its way in or out");
+                            last = error.to_string();
                         }
                         Err(other) => {
                             tracing::warn!(error = %other, "the owner cannot be worked through");
@@ -115,6 +130,8 @@ impl Inner {
                 tracing::warn!(
                     db = %self.endpoint.db.display(),
                     waited = ?started.elapsed(),
+                    attempts,
+                    last = %last,
                     "no owner in time"
                 );
                 return Err(Error::NoOwner {

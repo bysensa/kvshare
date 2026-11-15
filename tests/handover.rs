@@ -195,6 +195,75 @@ async fn the_tasks_of_one_client_commit_together() {
     close(owner, client, &base).await;
 }
 
+/// An owner that leaves goes on serving while it writes its memtable out, which is most
+/// of the time its leaving takes: the commits its client makes meanwhile are answered,
+/// and the next owner finds every one of them. Only then does it hang up. An owner that
+/// hung up first left its clients, and those waiting to become clients, nothing but
+/// another election.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_owner_that_leaves_serves_while_it_writes_its_memtable_out() {
+    let base = base("leaving");
+    let (owner, client) = owner_and_client(&base).await;
+    // What makes the leaving take a while: 24 MiB that are still in the memtable.
+    let value = vec![9u8; 1 << 20];
+    for n in 0..24 {
+        let mut tx = owner.begin().await.expect("a transaction");
+        tx.set(format!("fill{n:02}").into_bytes(), &value)
+            .expect("a write");
+        tx.commit().await.expect("a commit");
+    }
+
+    // The client commits small transactions one after another until its owner is gone.
+    let committing = tokio::spawn({
+        let client = client.clone();
+        async move {
+            let mut answered = Vec::new();
+            for n in 0u32.. {
+                let Ok(mut tx) = client.begin().await else {
+                    break;
+                };
+                if tx.is_local() || tx.set(format!("c{n:06}").into_bytes(), b"x").is_err() {
+                    break;
+                }
+                match tx.commit().await {
+                    Ok(()) => answered.push((n, std::time::Instant::now())),
+                    Err(_) => break,
+                }
+            }
+            answered
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let leaving = std::time::Instant::now();
+    owner.close().await.expect("the owner leaves");
+    let answered = committing.await.expect("the client's task ends");
+    let meanwhile = answered.iter().filter(|(_, at)| *at > leaving).count();
+    println!("commits the leaving owner answered: {meanwhile}");
+    assert!(
+        meanwhile >= 20,
+        "the owner answered {meanwhile} commits after it began to leave"
+    );
+
+    let tx = loop {
+        match client.begin().await {
+            Ok(tx) if tx.is_local() => break tx,
+            _ => tokio::task::yield_now().await,
+        }
+    };
+    for (n, _) in &answered {
+        assert!(
+            tx.get(format!("c{n:06}").into_bytes())
+                .await
+                .expect("a read")
+                .is_some(),
+            "commit {n}, which the leaving owner answered, is lost"
+        );
+    }
+    drop(tx);
+    client.close().await.expect("the client closes");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 /// A client that goes away leaves the owner's database open: the owner keeps committing
 /// after the connection's table is gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
