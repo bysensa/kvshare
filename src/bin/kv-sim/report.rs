@@ -135,6 +135,41 @@ fn hook_errors(dir: &Path) {
     }
 }
 
+/// The run's owners, as its processes told of them in `logs/events.log`: who owned the
+/// database, how long their opens took, how long it went without an owner that served,
+/// and the rows of hooks that owned it one after another, each for a moment.
+fn owners_story(dir: &Path) {
+    let Some(story) = crate::trace::owners(dir) else {
+        return;
+    };
+    let roles: Vec<String> = story
+        .by_role
+        .iter()
+        .map(|(role, count)| format!("{count} {role}"))
+        .collect();
+    println!(
+        "owners: {} ({}); an owner's open: {}; no owner between two: {}",
+        story.opens.len(),
+        roles.join(", "),
+        spread(story.opens.clone()),
+        spread(story.gaps.clone())
+    );
+    let longest = story.rows.iter().max().copied().unwrap_or((0, 0));
+    let most = story
+        .rows
+        .iter()
+        .map(|(_, hooks)| *hooks)
+        .max()
+        .unwrap_or(0);
+    println!(
+        "  hooks owning it one after another: {} rows, the longest {} ms ({} hooks), the most {} hooks",
+        story.rows.len(),
+        longest.0,
+        longest.1,
+        most
+    );
+}
+
 /// Print the report; whether the run failed.
 pub fn print(dir: &Path, run: &Run, found: &[Finding]) -> Result<bool, String> {
     let journals = Journals::read(dir).map_err(|e| e.to_string())?;
@@ -200,6 +235,7 @@ pub fn print(dir: &Path, run: &Run, found: &[Finding]) -> Result<bool, String> {
         }
     }
     hook_errors(dir);
+    owners_story(dir);
 
     let mut names: Vec<&String> = journals
         .times

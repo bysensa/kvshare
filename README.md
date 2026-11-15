@@ -148,9 +148,11 @@ find each other.
   version. A client that shares no version with its owner is `VersionMismatch`.
 
 kvshare tells what it does through `tracing`, under the target `kvshare`: at `info`, a
-process that comes to own the database, one that works through an owner, and an owner
-that handed the database over; at `warn`, an owner that is silent or lost, no owner in
-time, and a client the owner hung up on.
+process that comes to own the database (with the time its open took), one that works
+through an owner, and an owner that handed the database over (with the time that took
+and the part of it the owner no longer served); at `warn`, an owner that is silent or
+lost, no owner in time (with how often the database was tried and why the last try
+failed), and a client the owner hung up on.
 
 ## Options every process must set alike
 
@@ -289,6 +291,8 @@ async fn restock(tree: &Tree) -> Result<u64> {
   transaction open with its writes; SurrealKV closes a transaction at every commit.
 - A tree whose every handle is dropped lets the database go, as SurrealKV's does, on
   the runtime; `close` waits for it and tells its error.
+- An owner that closes its tree serves its clients until the memtable is written out,
+  where the tree's options have it written at the close (`flush_on_close`).
 - A cursor reads each value of its page unless it reads keys only (`set_keys_only`).
 - Finding an entry again for the next page steps through the versions of its key, so a
   history of a key with very many versions read in small pages reads them repeatedly.
@@ -424,6 +428,26 @@ for one: their close took 52 ms at the median and 75 ms at most. A process owns 
 database for a moment and is rarely asked meanwhile; still, a process that runs
 maintenance does better to run it rarely and over small ranges, as a close waits for it.
 
+An owner that leaves goes on serving while it writes its memtable out, and hangs up
+only then; writing the memtable out is most of what leaving takes. This matters when
+the owners are processes that each live a moment, as hooks are. A process that finds
+no owner tries again every 5 to 50 ms, and one that becomes the owner and leaves at
+once serves none of the others: each of them becomes the next owner in turn, or waits.
+In `kv-sim`, with an owner that hung up first, 45 hooks owned the database one after
+another for 2.8 s after an owner had been killed, though the database was never more
+than 0.24 s without an owner; hooks then waited up to 2.8 s, and in one run a hook
+found no owner within its 5 s. With an owner that serves while it leaves, the same
+run has 57 hooks that became owners where it had 127, the hooks that met a killed
+owner take 186 ms at p99 where they took 733 ms, and 0.76 s at most where they took
+2.8 s. So a process that may own the database does better to `close` its tree than to
+end with it open: one that just ends serves nobody on its way out.
+
+The price is the leaving owner's own: writing the memtable out and then closing the
+tree costs SurrealKV's fixed work twice. A hook that owned the database closed it in
+52 ms at the median and 75 ms at most; it now takes 94 ms at the median and 267 ms at
+p99 (33 such hooks in 10 minutes, of 55 722). The hooks as a whole do not notice: a
+calm hook's p99 stays at 21 ms.
+
 ### What history and the value log cost
 
 SurrealKV 1.4.0 gives back the space of the value log a whole file at a time, and only
@@ -484,8 +508,9 @@ cargo test
   among them every operation on the whole database, a restore with a transaction open,
   and cursors over keys only.
 - `tests/handover.rs`: the election, hand-over, conflicts, a client's own writes, many
-  tasks of one client and their commits together, a client that leaves, an owner that
-  crashes, an owner that
+  tasks of one client and their commits together, an owner that leaves and serves
+  while it writes its memtable out, a client that leaves, an owner that crashes, an
+  owner that
   leaves while it compacts, a client with other options, the bound on open
   transactions.
 - `tests/scan.rs`: cursors over ranges and histories in pages, the same in the owner
@@ -558,7 +583,12 @@ follow their flow, counts of references and the metrics' total add up, removed t
 are gone whole, every event has one answer, and the newest checkpoint holds together.
 The report gives the hooks' times by what the owner went through (calm, killed,
 stopped), every role's timings, the errors met, the processes' open files and memory,
-the space on disk, and the findings. The database is opened as Milou would open it: no
+the space on disk, and the findings. It also tells of the run's owners: how many
+there were and of which roles, how long their opens took, how long the database went
+without an owner that served between two of them, and the rows of hooks that owned it
+one after another. The processes write that story themselves, from kvshare's `tracing`
+events, to `logs/events.log`; a hook that could not open the database leaves every
+event of its election in `logs/trace-<pid>.log`. The database is opened as Milou would open it: no
 history, no value log, a memtable of 16 MiB. A run
 stops, and fails, when its disk has less than 2 GiB free.
 

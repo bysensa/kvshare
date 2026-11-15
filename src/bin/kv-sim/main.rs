@@ -22,6 +22,7 @@ mod keys;
 mod report;
 mod rng;
 mod roles;
+mod trace;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -36,7 +37,9 @@ fn main() -> ExitCode {
         },
         ["hook", run, seed, event] => match (seed.parse(), event.parse()) {
             (Ok(seed), Ok(event)) => {
-                runtime(false).block_on(roles::hook::run(PathBuf::from(run), seed, event))
+                let run = PathBuf::from(run);
+                trace::install(&run, "hook");
+                runtime(false).block_on(roles::hook::run(run, seed, event))
             }
             _ => return usage("a hook's seed and event are numbers"),
         },
@@ -49,6 +52,15 @@ fn main() -> ExitCode {
                 return usage("a role's seed is a number");
             };
             let run = PathBuf::from(run);
+            trace::install(
+                &run,
+                match *role {
+                    "agent" => "agent",
+                    "reader" => "reader",
+                    "indexer" => "indexer",
+                    _ => "keeper",
+                },
+            );
             runtime(true).block_on(async move {
                 match *role {
                     "agent" => roles::agent::run(run, seed).await,

@@ -11,6 +11,7 @@ use super::{Ctx, Op, builder};
 use crate::journal::Journal;
 use crate::keys::{self, Answer, OpId, Status, Task, Transition};
 use crate::rng::Rng;
+use crate::trace;
 
 /// How many tasks the events of a run share.
 pub const TASKS: u64 = 64;
@@ -18,11 +19,26 @@ pub const TASKS: u64 = 64;
 pub async fn run(run: PathBuf, seed: u64, event: u64) -> Result<(), String> {
     let started = Instant::now();
     let mut journal = Journal::open(&run, "hook", 'h').map_err(|e| e.to_string())?;
-    let tree = match builder(&run).build().await {
+    let opened = builder(&run).build().await;
+    // What the election gave up on and tried again: a connection the system did not
+    // answer, and a welcome that did not come.
+    for (words, name) in [
+        ("no connection in time", "connect_unanswered"),
+        ("no welcome in time", "welcome_unanswered"),
+    ] {
+        for _ in 0..trace::installed().map_or(0, |trace| trace.count(words)) {
+            journal.count(name);
+        }
+    }
+    let tree = match opened {
         Ok(tree) => tree,
         Err(error) => {
             journal.count("hook_open_failed");
             journal.time("hook.total", started.elapsed().as_micros(), "unopened");
+            // What the hook waited for, for whoever reads the run.
+            if let Some(trace) = trace::installed() {
+                trace.write();
+            }
             return Err(error.to_string());
         }
     };
