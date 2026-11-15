@@ -29,7 +29,8 @@ use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::protocol::{
-    Answer, Hello, Request, RequestId, Unframed, Welcome, agreed, encode_frame, read_frame,
+    Answer, Hello, MEETING_FRAME, Request, RequestId, Unframed, Welcome, agreed, encode_frame,
+    read_frame,
 };
 
 /// How many bytes of frames may wait for the writer before another frame has to wait
@@ -75,6 +76,8 @@ pub struct Connection {
     queued: Arc<Queued>,
     waiting: Arc<Waiting>,
     next: AtomicU64,
+    /// The largest frame the connection carries, in either direction.
+    max_frame: u32,
     reader: JoinHandle<()>,
     writer: JoinHandle<()>,
 }
@@ -111,20 +114,24 @@ impl Drop for Sent<'_> {
 
 impl Connection {
     /// Read the owner's welcome on `stream` within `within`, then read its answers and
-    /// write the requests in tasks of their own. If the owner speaks a version of the
+    /// write the requests in tasks of their own, in frames of `max_frame` bytes at most. If the owner speaks a version of the
     /// protocol this process speaks, the first frame written tells it which. Must be
     /// called on a Tokio runtime.
-    pub async fn open(stream: UnixStream, within: Duration) -> io::Result<(Connection, Welcome)> {
+    pub async fn open(
+        stream: UnixStream,
+        within: Duration,
+        max_frame: u32,
+    ) -> io::Result<(Connection, Welcome)> {
         let (read, write) = stream.into_split();
         let mut reader = BufReader::new(read);
-        let welcome: Welcome = tokio::time::timeout(within, read_frame(&mut reader))
+        let welcome: Welcome = tokio::time::timeout(within, read_frame(&mut reader, MEETING_FRAME))
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "no welcome in time"))??;
         let waiting: Arc<Waiting> = Arc::new(Mutex::new(Some(Unanswered::default())));
         let queued = Arc::new(Queued::default());
         let (frames, to_write) = mpsc::unbounded_channel();
         if let Some(version) = agreed(welcome.oldest, welcome.version) {
-            let hello = encode_frame(&Hello { version }).map_err(io::Error::from)?;
+            let hello = encode_frame(&Hello { version }, MEETING_FRAME).map_err(io::Error::from)?;
             queued.bytes.fetch_add(hello.len(), Ordering::AcqRel);
             let _ = frames.send(hello);
         }
@@ -132,6 +139,7 @@ impl Connection {
             frames,
             reader: tokio::spawn(read_answers(
                 reader,
+                max_frame,
                 Arc::clone(&waiting),
                 Arc::clone(&queued),
             )),
@@ -144,6 +152,7 @@ impl Connection {
             queued,
             waiting,
             next: AtomicU64::new(1),
+            max_frame,
         };
         Ok((connection, welcome))
     }
@@ -154,7 +163,7 @@ impl Connection {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         Ok(Frame {
             id,
-            bytes: encode_frame(&(id, request))?,
+            bytes: encode_frame(&(id, request), self.max_frame)?,
             commit: matches!(request, Request::Commit { .. }),
         })
     }
@@ -276,10 +285,12 @@ fn lock(waiting: &Waiting) -> MutexGuard<'_, Option<Unanswered>> {
 /// wake every caller still waiting with the end.
 async fn read_answers(
     mut reader: BufReader<OwnedReadHalf>,
+    max_frame: u32,
     waiting: Arc<Waiting>,
     queued: Arc<Queued>,
 ) {
-    while let Ok((id, answer)) = read_frame::<_, (RequestId, Answer)>(&mut reader).await {
+    while let Ok((id, answer)) = read_frame::<_, (RequestId, Answer)>(&mut reader, max_frame).await
+    {
         let caller = lock(&waiting).as_mut().and_then(|waiting| {
             // An answer nobody waits for settles a commit that was in doubt.
             waiting.in_doubt.remove(&id);
@@ -324,8 +335,11 @@ mod tests {
     use tokio::io::AsyncReadExt as _;
 
     use super::*;
-    use crate::protocol::{MAX_FRAME, VERSION, Write, write_frame};
+    use crate::protocol::{DEFAULT_MAX_ENTRY, VERSION, Write, max_frame, write_frame};
     use crate::types::WireDurability;
+
+    /// The largest frame of the tests' connections.
+    const LIMIT: u32 = max_frame(DEFAULT_MAX_ENTRY);
 
     /// A connection to a peer that welcomes it, takes its hello, and then reads only
     /// when told to.
@@ -338,11 +352,15 @@ mod tests {
             owner_pid: 1,
             fingerprint: [0; 32],
         };
-        write_frame(&mut theirs, &welcome).await.expect("a welcome");
-        let (connection, _) = Connection::open(ours, Duration::from_secs(1))
+        write_frame(&mut theirs, &welcome, MEETING_FRAME)
+            .await
+            .expect("a welcome");
+        let (connection, _) = Connection::open(ours, Duration::from_secs(1), LIMIT)
             .await
             .expect("a connection");
-        let hello: Hello = read_frame(&mut theirs).await.expect("the client's hello");
+        let hello: Hello = read_frame(&mut theirs, MEETING_FRAME)
+            .await
+            .expect("the client's hello");
         assert_eq!(hello, Hello { version: VERSION });
         (connection, theirs)
     }
@@ -376,7 +394,7 @@ mod tests {
             "frames of 8 MiB up to the bound"
         );
         let waiting = connection.queued.bytes.load(Ordering::Acquire);
-        assert!(waiting <= MAX_QUEUED + MAX_FRAME as usize, "{waiting} wait");
+        assert!(waiting <= MAX_QUEUED + LIMIT as usize, "{waiting} wait");
 
         assert!(
             !connection.tell(&big, false),
@@ -451,9 +469,10 @@ mod tests {
         assert!(connection.commit_in_doubt(), "its caller gave up");
 
         // The owner reads both requests and answers the commit.
-        let _: (RequestId, Request) = read_frame(&mut theirs).await.expect("the read");
-        let (id, _): (RequestId, Request) = read_frame(&mut theirs).await.expect("the commit");
-        write_frame(&mut theirs, &(id, Answer::Committed))
+        let _: (RequestId, Request) = read_frame(&mut theirs, LIMIT).await.expect("the read");
+        let (id, _): (RequestId, Request) =
+            read_frame(&mut theirs, LIMIT).await.expect("the commit");
+        write_frame(&mut theirs, &(id, Answer::Committed), LIMIT)
             .await
             .expect("an answer");
         for _ in 0..200 {

@@ -56,9 +56,10 @@ pub enum Error {
     },
     /// Any other SurrealKV error, as SurrealKV words it.
     Engine(String),
-    /// A key with its value holds more than [`MAX_ENTRY`](crate::MAX_ENTRY) bytes, or a
-    /// request or its answer is larger than one frame of the owner's socket. Nothing
-    /// was written or sent, and the transaction works on.
+    /// A key with its value holds more than the trees of the database allow
+    /// (`TreeBuilder::with_max_entry_size`, 64 MiB unless set), or a request or its
+    /// answer is larger than one frame of the owner's socket. Nothing was written or
+    /// sent, and the transaction works on.
     TooLarge(String),
     /// The owner already holds as many open transactions of this process as it allows.
     TooManyTransactions,
@@ -84,7 +85,8 @@ pub enum Error {
         this: u32,
     },
     /// The owner opened the database with options that must agree among its processes
-    /// (versions kept, comparator, value log, encryption) set otherwise.
+    /// (versions kept, comparator, value log, encryption, the size of an entry) set
+    /// otherwise.
     OptionsMismatch,
     Io(io::Error),
 }
@@ -119,7 +121,7 @@ impl fmt::Display for Error {
             }
             Error::OptionsMismatch => write!(
                 f,
-                "the owner opened the database with other versioning, comparator, value log or encryption options"
+                "the owner opened the database with other versioning, comparator, value log, encryption or entry size options"
             ),
             Error::Io(error) => write!(f, "{error}"),
         }

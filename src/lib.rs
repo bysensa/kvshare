@@ -42,7 +42,7 @@ pub use admin::{EncryptionStatus, FileTotals, KeyUsage};
 pub use api::{Operation, Transaction, Tree, TreeBuilder};
 pub use cursor::{Cursor, InternalKeyRef};
 pub use error::{Error, Result};
-pub use protocol::MAX_ENTRY;
+pub use protocol::{DEFAULT_MAX_ENTRY, LARGEST_MAX_ENTRY};
 pub use surrealkv::{
     BackgroundErrorReason, CipherPreference, CompactRangeOptions, Comparator, CompressionType,
     Durability, ErrorSeverity, FilterPolicy, HistoryOptions, InternalKeyKind, IntoBytes, Key,

@@ -18,8 +18,8 @@ use crate::endpoint::{Endpoint, same_user};
 use crate::error::KvError;
 use crate::exec::{apply, many, page};
 use crate::protocol::{
-    Answer, Hello, MAX_TRANSACTIONS, OLDEST, Request, RequestId, TxId, Unframed, VERSION, Welcome,
-    Write, encode_frame, read_frame, write_frame,
+    Answer, Hello, MAX_TRANSACTIONS, MEETING_FRAME, OLDEST, Request, RequestId, TxId, Unframed,
+    VERSION, Welcome, Write, encode_frame, read_frame, write_frame,
 };
 use crate::types::{WireDurability, WireMode};
 
@@ -39,9 +39,9 @@ pub(crate) struct Owner {
 
 impl Owner {
     /// Serve `tree`, which this process has just opened, on the socket of `endpoint`,
-    /// to the processes of the user `uid`, telling each client the `fingerprint` of
-    /// the options it opened the tree with; and leave the socket's path in the
-    /// database's directory for them.
+    /// to the processes of the user `uid`, in frames of `max_frame` bytes at most,
+    /// telling each client the `fingerprint` of the options it opened the tree with;
+    /// and leave the socket's path in the database's directory for them.
     ///
     /// Only the holder of the database's lock calls this, so a socket file found at
     /// the path was left by an owner that is gone, and it is removed without asking.
@@ -51,6 +51,7 @@ impl Owner {
         endpoint: &Endpoint,
         fingerprint: [u8; 32],
         uid: u32,
+        max_frame: u32,
     ) -> io::Result<Owner> {
         if let Some(dir) = endpoint.socket.parent() {
             // A directory made here is for this user only. One that is there already
@@ -79,7 +80,7 @@ impl Owner {
         let maintenance = Maintenance::default();
         let accept = tokio::spawn(accept(
             listener,
-            uid,
+            (uid, max_frame),
             Arc::clone(&tree),
             Arc::clone(&maintenance),
             welcome,
@@ -145,11 +146,12 @@ impl Drop for Owner {
 }
 
 /// Take the connections of the processes of the user `uid` until the task is aborted;
-/// each connection is served by a task of its own, which the set aborts when it is
-/// dropped. Another user's process is hung up on before it is told anything.
+/// each connection is served by a task of its own, in frames of `max_frame` bytes at
+/// most, which the set aborts when it is dropped. Another user's process is hung up on
+/// before it is told anything.
 async fn accept(
     listener: UnixListener,
-    uid: u32,
+    (uid, max_frame): (u32, u32),
     tree: Arc<Tree>,
     maintenance: Maintenance,
     welcome: Arc<Welcome>,
@@ -164,6 +166,7 @@ async fn accept(
                 }
                 connections.spawn(serve(
                     stream,
+                    max_frame,
                     Arc::clone(&tree),
                     Arc::clone(&maintenance),
                     Arc::clone(&welcome),
@@ -194,13 +197,14 @@ async fn accept(
 /// left open, and the work already started runs to its end.
 async fn serve(
     stream: UnixStream,
+    limit: u32,
     tree: Arc<Tree>,
     maintenance: Maintenance,
     welcome: Arc<Welcome>,
 ) {
     let (read, write) = stream.into_split();
     let writer = Arc::new(tokio::sync::Mutex::new(write));
-    if write_frame(&mut *writer.lock().await, &*welcome)
+    if write_frame(&mut *writer.lock().await, &*welcome, MEETING_FRAME)
         .await
         .is_err()
     {
@@ -210,7 +214,7 @@ async fn serve(
     let mut reader = BufReader::new(read);
     // The client's first frame names the version it speaks, one of those the welcome
     // offered. One that names another, or goes away, is not served.
-    match read_frame::<_, Hello>(&mut reader).await {
+    match read_frame::<_, Hello>(&mut reader, MEETING_FRAME).await {
         Ok(hello) if (OLDEST..=VERSION).contains(&hello.version) => {}
         Ok(hello) => {
             tracing::warn!(
@@ -229,7 +233,7 @@ async fn serve(
     // which every begin waits for.
     let mut running = JoinSet::new();
     let mut commits = JoinSet::new();
-    while let Ok((id, request)) = read_frame::<_, (RequestId, Request)>(&mut reader).await {
+    while let Ok((id, request)) = read_frame::<_, (RequestId, Request)>(&mut reader, limit).await {
         let answer = match request {
             Request::Begin {
                 tx,
@@ -313,7 +317,7 @@ async fn serve(
                             Err(error) => Answer::Failed(error.into()),
                         };
                         // A client that went away learns nothing; the commit stands.
-                        let _ = reply(&writer, id, answer).await;
+                        let _ = reply(&writer, limit, id, answer).await;
                     });
                     continue;
                 }
@@ -327,13 +331,13 @@ async fn serve(
                         Ok(reply) => Answer::Admin(reply),
                         Err(error) => Answer::Failed(error),
                     };
-                    let _ = reply(&writer, id, answer).await;
+                    let _ = reply(&writer, limit, id, answer).await;
                 });
                 continue;
             }
         };
         let answer = answer.unwrap_or_else(Answer::Failed);
-        if reply(&writer, id, answer).await.is_err() {
+        if reply(&writer, limit, id, answer).await.is_err() {
             break;
         }
         while running.try_join_next().is_some() {}
@@ -344,15 +348,17 @@ async fn serve(
     while commits.join_next().await.is_some() {}
 }
 
-/// Write `answer` to request `id` on the client's socket. An answer that no frame holds
-/// becomes the refusal that says so: the client asks for less and keeps its connection.
+/// Write `answer` to request `id` on the client's socket, in a frame of `limit` bytes
+/// at most. An answer that no frame holds becomes the refusal that says so: the client
+/// asks for less and keeps its connection.
 async fn reply(
     writer: &tokio::sync::Mutex<OwnedWriteHalf>,
+    limit: u32,
     id: RequestId,
     answer: Answer,
 ) -> io::Result<()> {
-    let frame = match encode_frame(&(id, &answer)) {
-        Err(Unframed::TooLong) => encode_frame(&(id, Answer::Failed(KvError::TooLarge)))?,
+    let frame = match encode_frame(&(id, &answer), limit) {
+        Err(Unframed::TooLong) => encode_frame(&(id, Answer::Failed(KvError::TooLarge)), limit)?,
         framed => framed?,
     };
     writer.lock().await.write_all(&frame).await
@@ -523,6 +529,10 @@ mod tests {
 #[cfg(test)]
 mod versions {
     use super::*;
+    use crate::protocol::{DEFAULT_MAX_ENTRY, max_frame};
+
+    /// The largest frame of the test's connections.
+    const LIMIT: u32 = max_frame(DEFAULT_MAX_ENTRY);
 
     /// The owner offers the versions it speaks and serves a client that names one of
     /// them; a client that names another is hung up on.
@@ -536,17 +546,21 @@ mod versions {
             .build()
             .expect("a tree");
         let me = crate::endpoint::uid().expect("this process's user");
-        let owner = Owner::start(tree, &endpoint, [0; 32], me).expect("an owner");
+        let owner = Owner::start(tree, &endpoint, [0; 32], me, LIMIT).expect("an owner");
 
         let mut stranger = UnixStream::connect(&endpoint.socket)
             .await
             .expect("connected");
-        let welcome: Welcome = read_frame(&mut stranger).await.expect("a welcome");
+        let welcome: Welcome = read_frame(&mut stranger, MEETING_FRAME)
+            .await
+            .expect("a welcome");
         assert_eq!((welcome.oldest, welcome.version), (OLDEST, VERSION));
         let hello = Hello {
             version: VERSION + 1,
         };
-        write_frame(&mut stranger, &hello).await.expect("a hello");
+        write_frame(&mut stranger, &hello, MEETING_FRAME)
+            .await
+            .expect("a hello");
         let read = (
             1u64,
             Request::Get {
@@ -556,9 +570,9 @@ mod versions {
                 for_update: false,
             },
         );
-        let _ = write_frame(&mut stranger, &read).await;
+        let _ = write_frame(&mut stranger, &read, LIMIT).await;
         assert!(
-            read_frame::<_, (RequestId, Answer)>(&mut stranger)
+            read_frame::<_, (RequestId, Answer)>(&mut stranger, LIMIT)
                 .await
                 .is_err(),
             "the owner hangs up on a version it does not speak"
@@ -567,9 +581,13 @@ mod versions {
         let mut client = UnixStream::connect(&endpoint.socket)
             .await
             .expect("connected");
-        let _: Welcome = read_frame(&mut client).await.expect("a welcome");
+        let _: Welcome = read_frame(&mut client, MEETING_FRAME)
+            .await
+            .expect("a welcome");
         let hello = Hello { version: VERSION };
-        write_frame(&mut client, &hello).await.expect("a hello");
+        write_frame(&mut client, &hello, MEETING_FRAME)
+            .await
+            .expect("a hello");
         let begin = (
             1u64,
             Request::Begin {
@@ -579,11 +597,14 @@ mod versions {
                 after_commits: false,
             },
         );
-        write_frame(&mut client, &begin).await.expect("a begin");
-        write_frame(&mut client, &(2u64, read.1))
+        write_frame(&mut client, &begin, LIMIT)
+            .await
+            .expect("a begin");
+        write_frame(&mut client, &(2u64, read.1), LIMIT)
             .await
             .expect("a read");
-        let (id, answer): (RequestId, Answer) = read_frame(&mut client).await.expect("an answer");
+        let (id, answer): (RequestId, Answer) =
+            read_frame(&mut client, LIMIT).await.expect("an answer");
         assert_eq!(id, 2);
         assert!(matches!(answer, Answer::Got(None)), "{answer:?}");
 

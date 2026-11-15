@@ -34,7 +34,8 @@ use crate::endpoint::{self, Endpoint};
 use crate::error::{Error, Result};
 use crate::exec::{open, page};
 use crate::protocol::{
-    Answer, At, DEFAULT_PAGE, Item, MAX_ENTRY, Request, Source, TxId, WRITES_AHEAD, Write,
+    Answer, At, DEFAULT_MAX_ENTRY, DEFAULT_PAGE, Item, LARGEST_MAX_ENTRY, Request, Source, TxId,
+    WRITES_AHEAD, Write, max_frame,
 };
 use crate::types::{KeyRange, ReadOptions, WireDurability, WireMode, fingerprint};
 
@@ -46,6 +47,8 @@ pub struct TreeBuilder {
     /// Where this process puts its socket if it owns the database; the default of its
     /// environment when none is named.
     run_dir: Option<PathBuf>,
+    /// The most a key and its value may hold together.
+    max_entry: usize,
     elect_within: Duration,
     call_within: Duration,
 }
@@ -65,6 +68,7 @@ impl TreeBuilder {
         TreeBuilder {
             options,
             run_dir: None,
+            max_entry: DEFAULT_MAX_ENTRY,
             elect_within: Duration::from_secs(5),
             call_within: Duration::from_secs(5),
         }
@@ -190,9 +194,32 @@ impl TreeBuilder {
         self
     }
 
+    /// The most a key and its value may hold together, in bytes: 64 MiB
+    /// ([`DEFAULT_MAX_ENTRY`]) unless set, and [`LARGEST_MAX_ENTRY`], just under
+    /// 4 GiB, at most. A write of more is `Error::TooLarge`, in an owner and in a
+    /// client alike.
+    ///
+    /// Every process of one database must set it alike, as any of them may own the
+    /// database and each has to take the frames the others send: a tree that allows
+    /// another size than its owner is refused with `Error::OptionsMismatch`.
+    ///
+    /// A large entry is costly whatever is allowed. SurrealKV holds the batch of a
+    /// commit in memory about four times over, and an entry that crosses the socket is
+    /// held on both sides of it as well.
+    pub fn with_max_entry_size(mut self, bytes: usize) -> Self {
+        self.max_entry = bytes;
+        self
+    }
+
     /// This builder's database, with the socket this process would serve it on, and
-    /// the user this process runs as.
+    /// the user this process runs as; or why its options cannot open a tree.
     fn endpoint(&self) -> Result<(Endpoint, u32)> {
+        if self.max_entry == 0 || self.max_entry > LARGEST_MAX_ENTRY {
+            return Err(Error::InvalidArgument(format!(
+                "an entry may hold from 1 to {LARGEST_MAX_ENTRY} bytes at most, not {}",
+                self.max_entry
+            )));
+        }
         let uid = endpoint::uid().map_err(Error::Io)?;
         let run_dir = match &self.run_dir {
             Some(run_dir) => run_dir.clone(),
@@ -220,7 +247,8 @@ impl TreeBuilder {
         let inner = Arc::new(Inner {
             endpoint,
             uid,
-            fingerprint: fingerprint(&self.options),
+            max_entry: self.max_entry,
+            fingerprint: fingerprint(&self.options, self.max_entry),
             options: self.options,
             elect_within: self.elect_within,
             call_within: self.call_within,
@@ -262,7 +290,9 @@ impl TreeBuilder {
     pub async fn current_owner(&self) -> Result<u32> {
         let (endpoint, uid) = self.endpoint()?;
         let within = self.call_within;
-        let (_, owner_pid) = connect(&endpoint, fingerprint(&self.options), uid, within).await?;
+        let agreed = fingerprint(&self.options, self.max_entry);
+        let frame = max_frame(self.max_entry);
+        let (_, owner_pid) = connect(&endpoint, agreed, (uid, frame), within).await?;
         Ok(owner_pid)
     }
 }
@@ -272,6 +302,8 @@ pub(crate) struct Inner {
     pub(crate) endpoint: Endpoint,
     /// The user this process runs as: the owner and its clients are one user's.
     pub(crate) uid: u32,
+    /// The most a key and its value may hold together, the same in every process.
+    pub(crate) max_entry: usize,
     pub(crate) options: Options,
     pub(crate) fingerprint: [u8; 32],
     pub(crate) elect_within: Duration,
@@ -863,13 +895,13 @@ impl Pending {
     }
 }
 
-/// Refuse an entry that holds more than [`MAX_ENTRY`] bytes. In a client it would not
-/// cross the socket; an owner refuses it too, so that what a process may write does not
-/// turn on the role it happens to hold.
-fn fits(bytes: usize) -> Result<()> {
-    if bytes > MAX_ENTRY {
+/// Refuse an entry that holds more than `limit` bytes, which the trees of its database
+/// allow. In a client it would not cross the socket; an owner refuses it too, so that
+/// what a process may write does not turn on the role it happens to hold.
+fn fits(bytes: usize, limit: usize) -> Result<()> {
+    if bytes > limit {
         return Err(Error::TooLarge(format!(
-            "an entry of {bytes} bytes; a key and its value hold at most {MAX_ENTRY}"
+            "an entry of {bytes} bytes; a key and its value hold at most {limit}"
         )));
     }
     Ok(())
@@ -1024,7 +1056,10 @@ impl Transaction {
     }
 
     pub fn set<K: IntoBytes, V: IntoBytes>(&mut self, key: K, value: V) -> Result<()> {
-        fits(key.as_slice().len() + value.as_slice().len())?;
+        fits(
+            key.as_slice().len() + value.as_slice().len(),
+            self.inner.max_entry,
+        )?;
         match &mut self.state {
             State::Local(transaction) => Ok(transaction.set(key, value)?),
             State::Remote(remote) => {
@@ -1044,7 +1079,10 @@ impl Transaction {
         value: V,
         timestamp: u64,
     ) -> Result<()> {
-        fits(key.as_slice().len() + value.as_slice().len())?;
+        fits(
+            key.as_slice().len() + value.as_slice().len(),
+            self.inner.max_entry,
+        )?;
         match &mut self.state {
             State::Local(transaction) => Ok(transaction.set_at(key, value, timestamp)?),
             State::Remote(remote) => {
@@ -1065,7 +1103,10 @@ impl Transaction {
         value: V,
         options: &WriteOptions,
     ) -> Result<()> {
-        fits(key.as_slice().len() + value.as_slice().len())?;
+        fits(
+            key.as_slice().len() + value.as_slice().len(),
+            self.inner.max_entry,
+        )?;
         match &mut self.state {
             State::Local(transaction) => Ok(transaction.set_with_options(key, value, options)?),
             State::Remote(remote) => {
@@ -1082,7 +1123,7 @@ impl Transaction {
 
     /// A hard delete, as SurrealKV's: the key's history goes with it.
     pub fn delete<K: IntoBytes>(&mut self, key: K) -> Result<()> {
-        fits(key.as_slice().len())?;
+        fits(key.as_slice().len(), self.inner.max_entry)?;
         match &mut self.state {
             State::Local(transaction) => Ok(transaction.delete(key)?),
             State::Remote(remote) => {
@@ -1100,7 +1141,7 @@ impl Transaction {
         key: K,
         options: &WriteOptions,
     ) -> Result<()> {
-        fits(key.as_slice().len())?;
+        fits(key.as_slice().len(), self.inner.max_entry)?;
         match &mut self.state {
             State::Local(transaction) => Ok(transaction.delete_with_options(key, options)?),
             State::Remote(remote) => {
@@ -1115,7 +1156,10 @@ impl Transaction {
     }
 
     pub fn delete_range<K: IntoBytes>(&mut self, start: K, end: K) -> Result<()> {
-        fits(start.as_slice().len() + end.as_slice().len())?;
+        fits(
+            start.as_slice().len() + end.as_slice().len(),
+            self.inner.max_entry,
+        )?;
         match &mut self.state {
             State::Local(transaction) => Ok(transaction.delete_range(start, end)?),
             State::Remote(remote) => {
@@ -1136,7 +1180,7 @@ impl Transaction {
 
     /// A tombstone, as SurrealKV's `soft_delete`: the key's history stays.
     pub fn soft_delete<K: IntoBytes>(&mut self, key: K) -> Result<()> {
-        fits(key.as_slice().len())?;
+        fits(key.as_slice().len(), self.inner.max_entry)?;
         match &mut self.state {
             State::Local(transaction) => Ok(transaction.soft_delete(key)?),
             State::Remote(remote) => {
@@ -1154,7 +1198,7 @@ impl Transaction {
         key: K,
         options: &WriteOptions,
     ) -> Result<()> {
-        fits(key.as_slice().len())?;
+        fits(key.as_slice().len(), self.inner.max_entry)?;
         match &mut self.state {
             State::Local(transaction) => Ok(transaction.soft_delete_with_options(key, options)?),
             State::Remote(remote) => {
@@ -1169,7 +1213,10 @@ impl Transaction {
     }
 
     pub fn replace<K: IntoBytes, V: IntoBytes>(&mut self, key: K, value: V) -> Result<()> {
-        fits(key.as_slice().len() + value.as_slice().len())?;
+        fits(
+            key.as_slice().len() + value.as_slice().len(),
+            self.inner.max_entry,
+        )?;
         match &mut self.state {
             State::Local(transaction) => Ok(transaction.replace(key, value)?),
             State::Remote(remote) => {

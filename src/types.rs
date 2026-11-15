@@ -199,11 +199,12 @@ impl From<&ReadOptions> for surrealkv::ReadOptions {
 }
 
 /// The options of a database that every process opening it must set alike, hashed: the
-/// versions kept, the comparator, the value log and encryption. The other options tune
-/// the process that owns the database and may differ from one process to another.
-pub(crate) fn fingerprint(options: &Options) -> [u8; 32] {
+/// versions kept, the comparator, the value log, encryption, and how much an entry may
+/// hold, `max_entry`. The other options tune the process that owns the database and may
+/// differ from one process to another.
+pub(crate) fn fingerprint(options: &Options, max_entry: usize) -> [u8; 32] {
     let agreed = format!(
-        "versioning={} retention_ns={} comparator={} vlog={} encrypted={} cipher={:?}",
+        "versioning={} retention_ns={} comparator={} vlog={} encrypted={} cipher={:?} entry={max_entry}",
         options.enable_versioning,
         options.versioned_history_retention_ns,
         options.comparator.name(),

@@ -22,7 +22,7 @@ use crate::client::Connection;
 use crate::endpoint::{Endpoint, same_user};
 use crate::error::{Error, Result};
 use crate::owner::Owner;
-use crate::protocol::{VERSION, agreed};
+use crate::protocol::{VERSION, agreed, max_frame};
 
 /// This process's part in a shared database.
 pub(crate) enum Role {
@@ -69,8 +69,10 @@ impl Inner {
         loop {
             match open(&self.options).await {
                 Ok(tree) => {
-                    let owner = Owner::start(tree, &self.endpoint, self.fingerprint, self.uid)
-                        .map_err(Error::Io)?;
+                    let frame = max_frame(self.max_entry);
+                    let owner =
+                        Owner::start(tree, &self.endpoint, self.fingerprint, self.uid, frame)
+                            .map_err(Error::Io)?;
                     tracing::info!(
                         db = %self.endpoint.db.display(),
                         socket = %self.endpoint.socket.display(),
@@ -82,7 +84,10 @@ impl Inner {
                     // The welcome may take what is left of the election: a stopped owner
                     // answers once it resumes.
                     let left = self.elect_within.saturating_sub(started.elapsed());
-                    match connect(&self.endpoint, self.fingerprint, self.uid, left).await {
+                    let frame = max_frame(self.max_entry);
+                    let connected =
+                        connect(&self.endpoint, self.fingerprint, (self.uid, frame), left).await;
+                    match connected {
                         Ok((connection, owner_pid)) => {
                             tracing::info!(
                                 db = %self.endpoint.db.display(),
@@ -123,8 +128,9 @@ impl Inner {
 
 /// Connect to the socket the owner of `endpoint`'s database left the path of, and check
 /// the owner against this process: its user `uid`, and in its welcome the protocol, the
-/// database and the `fingerprint` of the options that must agree. The connection and
-/// the owner's pid. The connection and the welcome together take at most `within`: a
+/// database and the `fingerprint` of the options that must agree, among them how much
+/// an entry holds and so how long a frame may be, `max_frame`. The connection and the
+/// owner's pid. The connection and the welcome together take at most `within`: a
 /// connect the system never answers was seen on macOS, the owner gone, and it must not
 /// hold up an election for ever.
 ///
@@ -133,7 +139,7 @@ impl Inner {
 pub(crate) async fn connect(
     endpoint: &Endpoint,
     fingerprint: [u8; 32],
-    uid: u32,
+    (uid, max_frame): (u32, u32),
     within: Duration,
 ) -> Result<(Arc<Connection>, u32)> {
     let deadline = tokio::time::Instant::now() + within;
@@ -156,7 +162,8 @@ pub(crate) async fn connect(
         _ => Error::Io(error),
     })?;
     let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-    let (connection, welcome) = Connection::open(stream, left).await.map_err(|error| {
+    let opened = Connection::open(stream, left, max_frame).await;
+    let (connection, welcome) = opened.map_err(|error| {
         if passing(&error) {
             Error::Io(error)
         } else {
@@ -240,7 +247,12 @@ mod tests {
     use tokio::net::UnixListener;
 
     use super::*;
-    use crate::protocol::{Hello, OLDEST, Welcome, read_frame, write_frame};
+    use crate::protocol::{
+        DEFAULT_MAX_ENTRY, Hello, MEETING_FRAME, OLDEST, Welcome, read_frame, write_frame,
+    };
+
+    /// The largest frame of the tests' connections.
+    const LIMIT: u32 = max_frame(DEFAULT_MAX_ENTRY);
 
     /// A client refuses an owner that speaks another version of the protocol, or holds
     /// another database, or set the options that must agree otherwise, before its
@@ -289,12 +301,14 @@ mod tests {
             endpoint.publish().expect("the fake owner's socket path");
             let fake = tokio::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("the client");
-                write_frame(&mut stream, &welcome).await.expect("a welcome");
+                write_frame(&mut stream, &welcome, MEETING_FRAME)
+                    .await
+                    .expect("a welcome");
                 // Keep the connection open until the client has read the welcome.
                 tokio::time::sleep(Duration::from_millis(200)).await;
             });
             let me = crate::endpoint::uid().expect("this process's user");
-            let refusal = connect(&endpoint, fingerprint, me, Duration::from_secs(1))
+            let refusal = connect(&endpoint, fingerprint, (me, LIMIT), Duration::from_secs(1))
                 .await
                 .err()
                 .expect("refused");
@@ -335,15 +349,18 @@ mod tests {
         };
         let newer = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("the client");
-            write_frame(&mut stream, &welcome).await.expect("a welcome");
-            read_frame::<_, Hello>(&mut stream)
+            write_frame(&mut stream, &welcome, MEETING_FRAME)
+                .await
+                .expect("a welcome");
+            read_frame::<_, Hello>(&mut stream, MEETING_FRAME)
                 .await
                 .expect("the client's hello")
         });
         let me = crate::endpoint::uid().expect("this process's user");
-        let (_connection, owner_pid) = connect(&endpoint, fingerprint, me, Duration::from_secs(1))
-            .await
-            .expect("an owner that speaks this version too");
+        let (_connection, owner_pid) =
+            connect(&endpoint, fingerprint, (me, LIMIT), Duration::from_secs(1))
+                .await
+                .expect("an owner that speaks this version too");
         assert_eq!(owner_pid, 1);
         assert_eq!(
             newer.await.expect("the fake owner ends"),

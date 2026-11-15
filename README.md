@@ -98,7 +98,9 @@ kvshare adds:
   database, see below), `with_election_timeout`, `with_call_timeout`;
 - `Tree::transact` and the trait `Operation`: a transaction run until it is known to
   have committed once, see Errors;
-- `MAX_ENTRY`: the most a key and its value hold together, 64 MiB;
+- `TreeBuilder::with_max_entry_size`: the most a key and its value hold together,
+  64 MiB (`DEFAULT_MAX_ENTRY`) unless set and just under 4 GiB (`LARGEST_MAX_ENTRY`) at
+  most; every process of a database sets it alike;
 - `TreeBuilder::current_owner`: the owner's pid, asked over its socket, without taking
   part in the election;
 - `Tree::is_owner`, `Tree::owner_pid`, `Transaction::is_local`;
@@ -153,8 +155,9 @@ Any process may become the owner, so every process of one database must open it 
 the options that change what is stored or how it is read. kvshare compares what it can:
 the owner's welcome carries a fingerprint of whether versions are kept and for how
 long, the comparator's name, whether the value log is on, whether there is a key
-manager, and the cipher. A client whose fingerprint differs is refused with
-`Error::OptionsMismatch` when it opens the tree.
+manager, the cipher, and how much an entry may hold (`with_max_entry_size`). A client
+whose fingerprint differs is refused with `Error::OptionsMismatch` when it opens the
+tree.
 
 Some options are objects kvshare cannot compare, and they must be the same in every
 process all the same:
@@ -190,9 +193,9 @@ kvshare's own:
   before it while it closes the database.
 - `TooManyTransactions`: a client holds 64 open transactions on its connection already;
   it learns this on the first request of the one too many.
-- `TooLarge`: a key with its value holds more than 64 MiB (`MAX_ENTRY`), or a request
-  or an answer does not fit one frame. Nothing was written or sent, and the transaction
-  works on.
+- `TooLarge`: a key with its value holds more than the trees of the database allow
+  (64 MiB unless `with_max_entry_size` says otherwise), or a request or an answer does
+  not fit one frame. Nothing was written or sent, and the transaction works on.
 - `Handshake`, `VersionMismatch`, `OptionsMismatch`: the owner and the client disagree.
 
 `Error` is `#[non_exhaustive]`: kvshare may add errors, so a `match` on it needs an arm
@@ -272,8 +275,10 @@ async fn restock(tree: &Tree) -> Result<u64> {
   answer in a `Result`: the owner may not answer.
 - A client waits for a checkpoint, a restore, a compaction or an encryption status as
   long as it takes, without the call timeout: they copy, rewrite or read files.
-- A key with its value holds at most 64 MiB (`MAX_ENTRY`), in an owner and in a client
-  alike: what a process may write does not turn on the role it happens to hold.
+- A key with its value holds at most what the trees of its database allow, 64 MiB
+  unless `with_max_entry_size` sets another size, in an owner and in a client alike:
+  what a process may write does not turn on the role it happens to hold. SurrealKV's
+  own bound is 4 GiB for the batch of one commit.
 - A client's transaction may write more than a frame holds: writes of more than 4 MiB
   travel to the owner ahead of the transaction's next request. The values of many keys
   (`get_many`) come from the owner in parts, as a cursor's pages do.
@@ -438,8 +443,24 @@ files again and compacting the tables: `kv-space` shows it with the key never re
 Data that is replaced or removed in no particular order, a code index or threads
 removed one by one, is better kept with no history and with the value log off, which
 `kv-sim` does. Values of hundreds of KiB and more, files above all, are better kept out
-of the database: a key with its value holds at most 64 MiB (`MAX_ENTRY`), crosses an
-owner's socket in one frame and is held whole in memory on both sides.
+of the database: an entry crosses an owner's socket in one frame and is held whole in
+memory on both sides.
+
+How much an entry may hold is the trees' to say (`with_max_entry_size`, 64 MiB unless
+set). That bound is kvshare's: SurrealKV took every size tried, up to 1 GiB. What a
+large entry costs is SurrealKV's, here with a memtable of 16 MiB and no value log, one
+value committed alone:
+
+| Value | Commit | The process grows by |
+|---|---|---|
+| 64 MiB | 125 ms | 257 MiB |
+| 128 MiB | 235 ms | 512 MiB |
+| 256 MiB | 0.8 s | 1.0 GiB |
+| 512 MiB | 1.6 s | 1.9 GiB |
+| 1 GiB | 6.5 s | 3.0 GiB |
+
+Through an owner's socket, with trees that allow 512 MiB, a value of 300 MiB took 1.6 s
+to commit and 0.7 s to read.
 
 ## Tests
 
@@ -473,7 +494,8 @@ cargo test
 - `tests/limits.rs`: a client's commit of more than a frame holds; values of many keys
   that no frame holds, and more keys than one request asks for; an entry over the
   limit, refused alike in both roles; a request no frame holds, which keeps its
-  transaction's writes.
+  transaction's writes; trees that allow larger entries, or smaller ones, than the
+  default; a tree that allows another size than its owner, which is refused.
 - `tests/meeting.rs`: trees with different run directories, which meet through the
   database's directory; a named run directory, which keeps its permissions; the
   default one, which is the user's own.

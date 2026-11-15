@@ -4,7 +4,7 @@
 mod common;
 
 use common::{base, close, owner_and_client};
-use kvshare::{Error, MAX_ENTRY};
+use kvshare::{DEFAULT_MAX_ENTRY, Error};
 
 /// The keys `<prefix>000` to `<prefix>069`.
 fn keys(prefix: char) -> Vec<Vec<u8>> {
@@ -71,12 +71,12 @@ async fn a_client_reads_many_values_that_no_frame_holds() {
 async fn an_entry_over_the_limit_is_refused_alike_by_the_owner_and_a_client() {
     let base = base("lim3");
     let (owner, client) = owner_and_client(&base).await;
-    let huge = vec![3u8; MAX_ENTRY];
+    let huge = vec![3u8; DEFAULT_MAX_ENTRY];
     for (role, tree) in [("owner", &owner), ("client", &client)] {
         let mut tx = tree.begin().await.expect("a transaction");
         assert!(
             matches!(tx.set(b"k", &huge), Err(Error::TooLarge(_))),
-            "the {role} refuses a key and a value of more than {MAX_ENTRY} bytes"
+            "the {role} refuses a key and a value of more than {DEFAULT_MAX_ENTRY} bytes"
         );
         tx.set(role.as_bytes(), b"small")
             .expect("a write that fits");
@@ -157,4 +157,96 @@ async fn a_client_reads_more_keys_than_one_request_asks_for() {
     );
     drop((local, remote));
     close(owner, client, &base).await;
+}
+
+/// The database in `base`, by trees that let a key and its value hold `bytes` at most.
+fn allowing(base: &std::path::Path, bytes: usize) -> kvshare::TreeBuilder {
+    common::builder(base).with_max_entry_size(bytes)
+}
+
+/// Trees that allow larger entries than the default write and read them, through the
+/// owner too: the frames of their connection grow with their entries. What is larger
+/// still is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn trees_that_allow_larger_entries_write_and_read_them() {
+    let base = base("lim6");
+    let owner = allowing(&base, 72 << 20).build().await.expect("the owner");
+    let client = allowing(&base, 72 << 20).build().await.expect("the client");
+    assert!(!client.is_owner().await.expect("a role"));
+
+    let value = vec![6u8; 66 << 20];
+    let mut tx = client.begin().await.expect("a transaction");
+    tx.set(b"large", &value)
+        .expect("an entry over the default of 64 MiB");
+    tx.commit().await.expect("a commit through the owner");
+    drop(value);
+    for (role, tree) in [("owner", &owner), ("client", &client)] {
+        let tx = tree.begin().await.expect("a transaction");
+        let read = tx.get(b"large").await.expect("a read");
+        assert_eq!(
+            read.map(|value| value.len()),
+            Some(66 << 20),
+            "the {role} reads it whole"
+        );
+    }
+
+    let mut tx = owner.begin().await.expect("a transaction");
+    assert!(
+        matches!(tx.set(b"k", vec![0u8; 73 << 20]), Err(Error::TooLarge(_))),
+        "73 MiB is over what these trees allow"
+    );
+    drop(tx);
+    close(owner, client, &base).await;
+}
+
+/// Trees that allow smaller entries refuse what the default lets through, an owner and
+/// a client alike.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn trees_that_allow_smaller_entries_refuse_larger_ones() {
+    let base = base("lim7");
+    let owner = allowing(&base, 1 << 20).build().await.expect("the owner");
+    let client = allowing(&base, 1 << 20).build().await.expect("the client");
+    let value = vec![7u8; 2 << 20];
+    for (role, tree) in [("owner", &owner), ("client", &client)] {
+        let mut tx = tree.begin().await.expect("a transaction");
+        assert!(
+            matches!(tx.set(b"k", &value), Err(Error::TooLarge(_))),
+            "the {role} refuses 2 MiB"
+        );
+        tx.set(role.as_bytes(), &value[..1 << 19])
+            .expect("half a MiB fits");
+        tx.commit().await.expect("a commit");
+    }
+    close(owner, client, &base).await;
+}
+
+/// How much an entry may hold is an option every process of a database sets alike: a
+/// tree that allows another size than the owner's is refused when it opens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn trees_that_allow_other_entry_sizes_do_not_meet() {
+    let base = base("lim8");
+    let owner = common::builder(&base).build().await.expect("the owner");
+    let other = allowing(&base, 1 << 20).build().await;
+    assert!(
+        matches!(other, Err(Error::OptionsMismatch)),
+        "{:?}",
+        other.err()
+    );
+    owner.close().await.expect("the owner closes");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// No size at all, and a size no frame can carry, are refused when the tree is opened.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_entry_size_out_of_range_is_refused() {
+    let base = base("lim9");
+    for bytes in [0, usize::MAX] {
+        let opened = allowing(&base, bytes).build().await;
+        assert!(
+            matches!(opened, Err(Error::InvalidArgument(_))),
+            "{bytes}: {:?}",
+            opened.err()
+        );
+    }
+    let _ = std::fs::remove_dir_all(&base);
 }

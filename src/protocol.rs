@@ -61,14 +61,35 @@ pub(crate) fn agreed(oldest: u32, newest: u32) -> Option<u32> {
 /// How many transactions one connection may hold open at once.
 pub const MAX_TRANSACTIONS: usize = 64;
 
-/// The most a key and its value hold together, in bytes: more is refused when it is
+/// The most a key and its value hold together, in bytes, unless the trees of a database
+/// say otherwise (`TreeBuilder::with_max_entry_size`). More is refused when it is
 /// written, by an owner and by a client alike, so that every entry crosses the socket in
 /// one frame whichever process owns the database.
-pub const MAX_ENTRY: usize = 64 << 20;
+pub const DEFAULT_MAX_ENTRY: usize = 64 << 20;
 
-/// The largest frame either side accepts: an entry of the greatest size and room for
-/// what travels with it. A longer one is a broken peer.
-pub const MAX_FRAME: u32 = (MAX_ENTRY + (1 << 20)) as u32;
+/// The most the trees of a database may let an entry hold: a frame's length is a `u32`,
+/// and SurrealKV writes the batch of one commit as one record of `u32::MAX` bytes at
+/// most.
+pub const LARGEST_MAX_ENTRY: usize = u32::MAX as usize - FRAME_ROOM;
+
+/// What a frame holds besides the largest entry: the rest of the message that carries
+/// it.
+const FRAME_ROOM: usize = 1 << 20;
+
+/// The largest frame a connection accepts when its entries hold `max_entry` bytes at
+/// most: an entry of that size and room for what travels with it. A longer one is a
+/// broken peer.
+pub(crate) const fn max_frame(max_entry: usize) -> u32 {
+    if max_entry > LARGEST_MAX_ENTRY {
+        u32::MAX
+    } else {
+        (max_entry + FRAME_ROOM) as u32
+    }
+}
+
+/// The largest frame a welcome or a hello may be. They are read before the two sides
+/// know that they allow entries of the same size, and they are small.
+pub(crate) const MEETING_FRAME: u32 = 64 << 10;
 
 /// How many bytes of writes a client's transaction keeps at most before it sends them
 /// ahead of its next request, so that a transaction may write more than a frame holds.
@@ -397,19 +418,19 @@ pub(crate) enum Answer {
     Failed(KvError),
 }
 
-/// Write `message` as one frame, in one write.
-pub(crate) async fn write_frame<W, T>(writer: &mut W, message: &T) -> io::Result<()>
+/// Write `message` as one frame of `limit` bytes at most, in one write.
+pub(crate) async fn write_frame<W, T>(writer: &mut W, message: &T, limit: u32) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
     T: Serialize,
 {
-    writer.write_all(&encode_frame(message)?).await
+    writer.write_all(&encode_frame(message, limit)?).await
 }
 
 /// Why a message did not become a frame.
 #[derive(Debug)]
 pub(crate) enum Unframed {
-    /// It is longer than [`MAX_FRAME`].
+    /// It is longer than a frame of its connection may be.
     TooLong,
     Encoding(postcard::Error),
 }
@@ -425,28 +446,28 @@ impl From<Unframed> for io::Error {
     }
 }
 
-/// `message` as one frame: its length, then the message.
-pub(crate) fn encode_frame<T: Serialize>(message: &T) -> Result<Vec<u8>, Unframed> {
+/// `message` as one frame of `limit` bytes at most: its length, then the message.
+pub(crate) fn encode_frame<T: Serialize>(message: &T, limit: u32) -> Result<Vec<u8>, Unframed> {
     let mut frame = postcard::to_extend(message, vec![0u8; 4]).map_err(Unframed::Encoding)?;
     let length = u32::try_from(frame.len() - 4)
         .ok()
-        .filter(|length| *length <= MAX_FRAME)
+        .filter(|length| *length <= limit)
         .ok_or(Unframed::TooLong)?;
     frame[..4].copy_from_slice(&length.to_le_bytes());
     Ok(frame)
 }
 
-/// Read one frame and decode its message.
-pub(crate) async fn read_frame<R, T>(reader: &mut R) -> io::Result<T>
+/// Read one frame of `limit` bytes at most and decode its message.
+pub(crate) async fn read_frame<R, T>(reader: &mut R, limit: u32) -> io::Result<T>
 where
     R: AsyncRead + Unpin,
     T: DeserializeOwned,
 {
     let length = reader.read_u32_le().await?;
-    if length > MAX_FRAME {
+    if length > limit {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("a frame of {length} bytes is longer than {MAX_FRAME}"),
+            format!("a frame of {length} bytes is longer than {limit}"),
         ));
     }
     let mut body = vec![0u8; length as usize];
@@ -477,18 +498,19 @@ mod tests {
                 Write::SetSavepoint,
             ],
         };
+        let limit = max_frame(DEFAULT_MAX_ENTRY);
         let mut wire = Vec::new();
-        write_frame(&mut wire, &(9u64, &request))
+        write_frame(&mut wire, &(9u64, &request), limit)
             .await
             .expect("a frame");
-        let (id, read): (RequestId, Request) = read_frame(&mut wire.as_slice())
+        let (id, read): (RequestId, Request) = read_frame(&mut wire.as_slice(), limit)
             .await
             .expect("the frame back");
         assert_eq!(id, 9);
         assert_eq!(read, request);
 
-        let huge = (MAX_FRAME + 1).to_le_bytes();
-        let error = read_frame::<_, Request>(&mut huge.as_slice())
+        let huge = (limit + 1).to_le_bytes();
+        let error = read_frame::<_, Request>(&mut huge.as_slice(), limit)
             .await
             .expect_err("too long");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
